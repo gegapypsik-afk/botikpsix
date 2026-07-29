@@ -1,0 +1,16 @@
+# Секреты и локальные данные — НЕ коммитим
+config.json
+data.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Редакторы/ОС
+.vscode/
+.idea/
+.DS_Store

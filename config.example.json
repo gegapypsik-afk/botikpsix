@@ -1,4 +1,6 @@
 {
   "token": "ВСТАВЬТЕ_СЮДА_ТОКЕН_ТОЛЬКО_ДЛЯ_ЛОКАЛЬНОГО_ЗАПУСКА",
-  "prefix": "!"
+  "prefix": "!",
+  "brand_name": "yooma.su",
+  "brand_url": "https://yooma.su"
 }

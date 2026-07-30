@@ -64,6 +64,32 @@ if not TOKEN:
     )
 
 # ---------------------------------------------------------------------------
+# Оформление — единая фиолетовая тема
+# ---------------------------------------------------------------------------
+# Название и ссылка бренда для подписи в эмбедах (можно переопределить через env).
+BRAND_NAME = os.environ.get("BRAND_NAME") or CONFIG.get("brand_name", "yooma.su")
+BRAND_URL = os.environ.get("BRAND_URL") or CONFIG.get("brand_url", "")
+
+
+class Colors:
+    """Фиолетовая палитра проекта (оттенки одной гаммы для узнаваемого стиля)."""
+    PRIMARY = discord.Color(0x8B5CF6)   # основной фиолетовый — панели, инфо
+    LIGHT = discord.Color(0xA78BFA)     # светлый акцент — успех/подтверждение
+    DEEP = discord.Color(0x6D28D9)      # глубокий фиолетовый — логи, закрытие
+    ACCENT = discord.Color(0xC026D3)    # фуксия — предупреждения/автомод
+    DANGER = discord.Color(0xE11D48)    # тревожный — баны/серьёзные наказания
+
+
+def brand(embed: discord.Embed, guild: discord.Guild = None) -> discord.Embed:
+    """Единое оформление эмбеда: подпись бренда и иконка сервера как миниатюра."""
+    if not embed.footer or not embed.footer.text:
+        embed.set_footer(text=f"{BRAND_NAME} • тикет-система")
+    if guild is not None and guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    return embed
+
+
+# ---------------------------------------------------------------------------
 # Хранилище настроек (JSON-файл data.json)
 # ---------------------------------------------------------------------------
 DEFAULT_CATEGORIES = {
@@ -245,7 +271,7 @@ def _clip(text, length):
 
 
 def settings_embed(gdata: dict, guild: discord.Guild) -> discord.Embed:
-    embed = discord.Embed(title="⚙️ Настройки тикет-системы", color=discord.Color.blurple())
+    embed = discord.Embed(title="⚙️ Настройки тикет-системы", color=Colors.PRIMARY)
 
     def roles(ids):
         return ", ".join(f"<@&{r}>" for r in ids) if ids else "не заданы"
@@ -265,13 +291,15 @@ def settings_embed(gdata: dict, guild: discord.Guild) -> discord.Embed:
     for key, c in gdata["categories"].items():
         lines.append(f"{c.get('emoji') or '•'} **{c['label']}** (`{key}`)")
     embed.add_field(name="Категории тикетов", value="\n".join(lines) or "—", inline=False)
-    embed.set_footer(text="Команда !помощь — список всех команд")
+    embed.set_footer(text=f"{BRAND_NAME} • команда !помощь — список всех команд")
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
     return embed
 
 
 def stats_embed(gdata: dict) -> discord.Embed:
     s = gdata["stats"]
-    embed = discord.Embed(title="📊 Статистика тикетов", color=discord.Color.green())
+    embed = discord.Embed(title="📊 Статистика тикетов", color=Colors.LIGHT)
     embed.add_field(name="Создано всего", value=str(s["created"]))
     embed.add_field(name="Закрыто", value=str(s["closed"]))
     embed.add_field(name="Принято", value=str(s["accepted"]))
@@ -280,6 +308,7 @@ def stats_embed(gdata: dict) -> discord.Embed:
     for key, c in gdata["categories"].items():
         lines.append(f"{c.get('emoji') or '•'} {c['label']}: **{s['by_category'].get(key, 0)}**")
     embed.add_field(name="По категориям", value="\n".join(lines) or "—", inline=False)
+    brand(embed)
     return embed
 
 
@@ -290,7 +319,7 @@ async def log_event(guild: discord.Guild, gdata: dict, description: str, file: d
     ch = guild.get_channel(cid)
     if not ch:
         return
-    embed = discord.Embed(description=description, color=discord.Color.dark_grey(),
+    embed = discord.Embed(description=description, color=Colors.DEEP,
                           timestamp=datetime.now(timezone.utc))
     embed.set_author(name="Журнал тикетов")
     try:
@@ -323,7 +352,7 @@ def automod_embed(gdata: dict) -> discord.Embed:
     embed = discord.Embed(
         title="🤖 Настройки автомода",
         description=f"Состояние: **{on if am['enabled'] else off}**",
-        color=discord.Color.green() if am["enabled"] else discord.Color.red(),
+        color=Colors.PRIMARY if am["enabled"] else Colors.DEEP,
     )
     embed.add_field(
         name="🚫 Анти-спам",
@@ -397,8 +426,9 @@ async def post_ticket_panel(channel: discord.TextChannel, gdata: dict):
     embed = discord.Embed(
         title=gdata["panel_title"],
         description=gdata["panel_description"],
-        color=discord.Color.blurple(),
+        color=Colors.PRIMARY,
     )
+    brand(embed, channel.guild)
     await channel.send(embed=embed, view=TicketPanelView(gdata))
 
 
@@ -491,11 +521,12 @@ async def handle_ticket_create(interaction: discord.Interaction, key: str):
             "Опишите ваш вопрос как можно подробнее — сотрудник скоро ответит.\n\n"
             "Управляйте тикетом с помощью кнопок ниже."
         ),
-        color=discord.Color.green(),
+        color=Colors.LIGHT,
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="Автор", value=interaction.user.mention)
     embed.add_field(name="Категория", value=cat["label"])
+    brand(embed, guild)
 
     support_mentions = " ".join(f"<@&{rid}>" for rid in gdata["support_roles"])
     content = f"{interaction.user.mention} {support_mentions}".strip()
@@ -557,7 +588,7 @@ async def close_ticket(channel: discord.TextChannel, closed_by: discord.Member, 
         opener = f"<@{info['user_id']}>"
 
     embed = discord.Embed(title=f"🔒 Тикет #{number if number=='?' else f'{number:04d}'} закрыт",
-                          color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
+                          color=Colors.DEEP, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Категория", value=category_label)
     embed.add_field(name="Автор", value=opener)
     embed.add_field(name="Закрыл", value=closed_by.mention)
@@ -1033,7 +1064,7 @@ async def handle_automod_violation(message: discord.Message, gdata: dict,
         description=(f"{member.mention}, нарушение: **{reason}**.\n"
                      + (f"Выдан мут на **{format_duration(seconds)}**."
                         if muted else "⚠️ Не удалось выдать мут (проверьте права/роль бота).")),
-        color=discord.Color.orange(),
+        color=Colors.ACCENT,
     )
     try:
         await channel.send(embed=notice, delete_after=8)
@@ -1043,7 +1074,7 @@ async def handle_automod_violation(message: discord.Message, gdata: dict,
     # 5) запись в лог модерации
     log = discord.Embed(
         title="🤖 Автомод",
-        color=discord.Color.orange(),
+        color=Colors.ACCENT,
         timestamp=datetime.now(timezone.utc),
     )
     log.add_field(name="Участник", value=f"{member.mention} (`{member.id}`)", inline=False)
@@ -1202,8 +1233,9 @@ async def send_admin_panel(ctx):
             "🤖 **Автомод** — анти-спам и анти-приглашения\n"
             "📮 **Отправить панель тикетов** — опубликовать панель создания тикетов"
         ),
-        color=discord.Color.blurple(),
+        color=Colors.PRIMARY,
     )
+    brand(embed, ctx.guild)
     await ctx.send(embed=embed, view=AdminPanelView())
 
 
@@ -1249,7 +1281,7 @@ async def ban_cmd(ctx, member: discord.Member, *, reason: str = "Причина 
     except discord.Forbidden:
         await ctx.reply("❌ У меня нет права «Банить участников» или роль бота слишком низкая.")
         return
-    embed = _mod_embed("🔨 Участник забанен", discord.Color.dark_red(), member, ctx.author, reason)
+    embed = _mod_embed("🔨 Участник забанен", Colors.DANGER, member, ctx.author, reason)
     await ctx.reply(embed=embed)
     await mod_log(ctx.guild, storage.guild(ctx.guild.id), embed)
 
@@ -1267,7 +1299,7 @@ async def unban_cmd(ctx, user_id: int, *, reason: str = "Причина не у�
         await ctx.reply("❌ У меня нет права «Банить участников».")
         return
     embed = discord.Embed(
-        title="♻️ Участник разбанен", color=discord.Color.green(),
+        title="♻️ Участник разбанен", color=Colors.LIGHT,
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="Пользователь", value=f"{user} (`{user.id}`)", inline=False)
@@ -1287,7 +1319,7 @@ async def kick_cmd(ctx, member: discord.Member, *, reason: str = "Причина
     except discord.Forbidden:
         await ctx.reply("❌ У меня нет права «Выгонять участников» или роль бота слишком низкая.")
         return
-    embed = _mod_embed("👢 Участник кикнут", discord.Color.orange(), member, ctx.author, reason)
+    embed = _mod_embed("👢 Участник кикнут", Colors.ACCENT, member, ctx.author, reason)
     await ctx.reply(embed=embed)
     await mod_log(ctx.guild, storage.guild(ctx.guild.id), embed)
 
@@ -1308,7 +1340,7 @@ async def mute_cmd(ctx, member: discord.Member, duration: str, *, reason: str = 
     except discord.Forbidden:
         await ctx.reply("❌ У меня нет права «Тайм-аут участникам» или роль бота слишком низкая.")
         return
-    embed = _mod_embed("🔇 Участник в муте", discord.Color.dark_orange(), member, ctx.author,
+    embed = _mod_embed("🔇 Участник в муте", Colors.ACCENT, member, ctx.author,
                        reason, extra=("Длительность", format_duration(seconds)))
     await ctx.reply(embed=embed)
     await mod_log(ctx.guild, storage.guild(ctx.guild.id), embed)
@@ -1322,7 +1354,7 @@ async def unmute_cmd(ctx, member: discord.Member, *, reason: str = "Причин
     except discord.Forbidden:
         await ctx.reply("❌ У меня нет права «Тайм-аут участникам» или роль бота слишком низкая.")
         return
-    embed = _mod_embed("🔊 Мут снят", discord.Color.green(), member, ctx.author, reason)
+    embed = _mod_embed("🔊 Мут снят", Colors.LIGHT, member, ctx.author, reason)
     await ctx.reply(embed=embed)
     await mod_log(ctx.guild, storage.guild(ctx.guild.id), embed)
 
@@ -1361,7 +1393,7 @@ async def automod_exempt_role(ctx, role: discord.Role):
 
 @bot.command(name="помощь")
 async def help_cmd(ctx):
-    embed = discord.Embed(title="📖 Команды бота", color=discord.Color.blurple())
+    embed = discord.Embed(title="📖 Команды бота", color=Colors.PRIMARY)
     embed.add_field(
         name="🎫 Тикеты — настройка (администрация)",
         value=(
@@ -1399,7 +1431,9 @@ async def help_cmd(ctx):
         ),
         inline=False,
     )
-    embed.set_footer(text="В самом тикете: Принять тикет • Закрыть тикет • Закрыть с причиной")
+    embed.set_footer(text=f"{BRAND_NAME} • в тикете: Принять • Закрыть • Закрыть с причиной")
+    if ctx.guild and ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
     await ctx.reply(embed=embed)
 
 

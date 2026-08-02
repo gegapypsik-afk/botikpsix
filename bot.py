@@ -16,10 +16,14 @@
 - Модерация: баны, разбаны, кики, муты (тайм-ауты) и размуты.
 - Автомод: авто-мут за спам/флуд и за приглашения в Discord (ссылки discord.gg).
 - Красивая панель настроек автомода с кнопками-переключателями.
+- ИИ-собеседник: если упомянуть бота (@), он отвечает как ролевой персонаж,
+  который шарит за мемы и интернет-культуру (через OpenAI-совместимый API).
+- Прогноз погоды по городам командой !погода (бесплатный Open-Meteo, без ключа).
+- Развлечения и утилиты: !мем, !аватар, !юзер, !сервер, !кости, !шар, !выбери.
 - Все команды через префикс "!" и на русском языке.
 - Токен читается из переменной окружения DISCORD_TOKEN (или из config.json).
 
-Требования: Python 3.9+, discord.py >= 2.3.2
+Требования: Python 3.9+, discord.py >= 2.3.2, aiohttp
 """
 
 import io
@@ -28,9 +32,11 @@ import json
 import os
 import copy
 import time
+import random
 import asyncio
 from datetime import datetime, timezone, timedelta
 
+import aiohttp
 import discord
 from discord.ext import commands
 
@@ -69,6 +75,37 @@ if not TOKEN:
 # Название и ссылка бренда для подписи в эмбедах (можно переопределить через env).
 BRAND_NAME = os.environ.get("BRAND_NAME") or CONFIG.get("brand_name", "yooma.su")
 BRAND_URL = os.environ.get("BRAND_URL") or CONFIG.get("brand_url", "")
+
+
+# ---------------------------------------------------------------------------
+# Настройки ИИ-собеседника (OpenAI-совместимый API)
+# ---------------------------------------------------------------------------
+# Ключ и адрес API берутся из переменных окружения (рекомендуется) либо из
+# config.json. Подойдёт любой OpenAI-совместимый провайдер: OpenAI, Groq,
+# OpenRouter, Together и т.п. — достаточно поменять AI_BASE_URL и AI_MODEL.
+AI_API_KEY = (
+    os.environ.get("AI_API_KEY")
+    or os.environ.get("OPENAI_API_KEY")
+    or CONFIG.get("ai_api_key", "")
+)
+AI_BASE_URL = (
+    os.environ.get("AI_BASE_URL")
+    or CONFIG.get("ai_base_url", "https://api.openai.com/v1")
+).rstrip("/")
+AI_MODEL = os.environ.get("AI_MODEL") or CONFIG.get("ai_model", "gpt-4o-mini")
+# Имя персонажа по умолчанию (можно переопределить на сервере командой !ии_имя).
+AI_PERSONA_NAME = os.environ.get("AI_BOT_NAME") or CONFIG.get("ai_bot_name", "Ботя")
+
+# Общий HTTP-клиент для запросов к ИИ и к API погоды/мемов.
+_http_session: "aiohttp.ClientSession | None" = None
+
+
+async def get_http_session() -> aiohttp.ClientSession:
+    """Ленивая инициализация общего aiohttp-клиента."""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
 
 
 class Colors:
@@ -127,6 +164,12 @@ DEFAULT_AUTOMOD = {
     "exempt_roles": [],          # роли с иммунитетом к автомоду
 }
 
+# Настройки ИИ-собеседника по умолчанию (на каждый сервер)
+DEFAULT_AI = {
+    "enabled": True,     # отвечает ли бот на упоминания как ИИ
+    "persona": None,     # имя/описание персонажа для role play (None = по умолчанию)
+}
+
 
 def _default_guild():
     return {
@@ -146,6 +189,7 @@ def _default_guild():
         "stats": {"created": 0, "closed": 0, "accepted": 0, "by_category": {}},
         "open_tickets": {},           # {channel_id: {...}}
         "automod": copy.deepcopy(DEFAULT_AUTOMOD),
+        "ai": copy.deepcopy(DEFAULT_AI),
     }
 
 
@@ -185,6 +229,9 @@ class Storage:
         for k, v in base["automod"].items():
             if k not in g["automod"]:
                 g["automod"][k] = v
+        for k, v in base["ai"].items():
+            if k not in g["ai"]:
+                g["ai"][k] = v
         return g
 
 
@@ -934,6 +981,14 @@ class TicketBot(commands.Bot):
         self.add_view(TicketControlView())
         self.add_view(AdminPanelView())
 
+    async def close(self):
+        # аккуратно закрываем общий HTTP-клиент (ИИ/погода/мемы)
+        global _http_session
+        if _http_session is not None and not _http_session.closed:
+            await _http_session.close()
+        _http_session = None
+        await super().close()
+
 
 bot = TicketBot(
     command_prefix=PREFIX,
@@ -1123,6 +1178,130 @@ async def run_automod(message: discord.Message) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# ИИ-собеседник (role play + мемы). Отвечает, когда упомянули бота.
+# ---------------------------------------------------------------------------
+AI_HISTORY_TURNS = 8        # сколько последних реплик помнить в канале
+AI_COOLDOWN_SECONDS = 4     # антифлуд: не чаще одного ответа игроку раз в N сек
+AI_MAX_REPLY = 1900         # запас до лимита Discord в 2000 символов
+
+# История разговора по каналам: channel_id -> [{"role","content"}, ...]
+_ai_history: dict[int, list] = {}
+# Метки последнего обращения: (guild_id, user_id) -> ts
+_ai_cooldown: dict[tuple, float] = {}
+
+
+def _ai_system_prompt(persona: str, guild_name: str) -> str:
+    """Системный промпт: живой ролевой персонаж, который шарит за мемы."""
+    return (
+        f"Ты — {persona}, колоритный участник Discord-сервера «{guild_name}». "
+        "Ты общаешься с людьми в чате и отыгрываешь роль своего персонажа (role play). "
+        "Пиши на живом, неформальном русском с лёгким юмором и самоиронией. "
+        "Ты отлично шаришь за мемы, интернет-культуру и сленг, любишь уместно ввернуть "
+        "мем, шутку или отсылку, но не перебарщиваешь. "
+        "Отвечай коротко и по делу — обычно 1–4 предложения, как обычный человек в чате, "
+        "без официоза, без заголовков и длинных списков. Эмодзи — умеренно. "
+        "Оставайся в образе, будь дружелюбным, не оскорбляй участников и не переходи на личности. "
+        "Не давай вредных, опасных, противоправных или NSFW-советов — если просят такое, "
+        "отшутись и переведи тему. "
+        "Отвечай на том же языке, на котором к тебе обратились."
+    )
+
+
+async def ask_ai(messages: list) -> str:
+    """Запрос к OpenAI-совместимому Chat Completions API. Бросает исключение при ошибке."""
+    session = await get_http_session()
+    payload = {
+        "model": AI_MODEL,
+        "messages": messages,
+        "temperature": 0.9,
+        "max_tokens": 500,
+    }
+    headers = {
+        "Authorization": f"Bearer {AI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    url = f"{AI_BASE_URL}/chat/completions"
+    async with session.post(
+        url, json=payload, headers=headers,
+        timeout=aiohttp.ClientTimeout(total=45),
+    ) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status != 200:
+            detail = ""
+            if isinstance(data, dict):
+                err = data.get("error")
+                detail = err.get("message") if isinstance(err, dict) else str(err or "")
+            raise RuntimeError(detail or f"HTTP {resp.status}")
+        try:
+            return (data["choices"][0]["message"]["content"] or "").strip()
+        except (KeyError, IndexError, TypeError):
+            raise RuntimeError("Пустой или неожиданный ответ от ИИ-провайдера.")
+
+
+def _strip_bot_mention(message: discord.Message) -> str:
+    """Убирает упоминание бота из текста, оставляя сам запрос."""
+    content = message.content or ""
+    for token in (f"<@{bot.user.id}>", f"<@!{bot.user.id}>"):
+        content = content.replace(token, "")
+    return content.strip()
+
+
+async def maybe_ai_reply(message: discord.Message) -> bool:
+    """Отвечает как ИИ, если это включено. Возвращает True, если сообщение обработано."""
+    gdata = storage.guild(message.guild.id)
+    ai = gdata["ai"]
+    if not ai.get("enabled", True):
+        return False
+
+    if not AI_API_KEY:
+        await message.reply(
+            "🤖 Меня ещё не подключили к «мозгам». Админ, задайте переменную окружения "
+            "`AI_API_KEY` (при желании также `AI_BASE_URL` и `AI_MODEL`), и я смогу базарить.",
+            mention_author=False,
+        )
+        return True
+
+    # Антифлуд: слишком частые упоминания одним человеком молча игнорируем.
+    now = time.time()
+    ckey = (message.guild.id, message.author.id)
+    if now - _ai_cooldown.get(ckey, 0.0) < AI_COOLDOWN_SECONDS:
+        return False
+    _ai_cooldown[ckey] = now
+
+    prompt_text = _strip_bot_mention(message) or "Привет!"
+    persona = ai.get("persona") or AI_PERSONA_NAME
+
+    history = _ai_history.setdefault(message.channel.id, [])
+    history.append({"role": "user", "content": f"{message.author.display_name}: {prompt_text}"})
+    # Держим только последние реплики, чтобы не раздувать контекст.
+    if len(history) > AI_HISTORY_TURNS * 2:
+        del history[: len(history) - AI_HISTORY_TURNS * 2]
+
+    conversation = [
+        {"role": "system", "content": _ai_system_prompt(persona, message.guild.name)}
+    ] + history
+
+    try:
+        async with message.channel.typing():
+            reply = await ask_ai(conversation)
+    except Exception as exc:
+        print(f"[ИИ] Ошибка запроса: {exc}")
+        if history and history[-1]["role"] == "user":
+            history.pop()  # откатываем незавершённую реплику
+        await message.reply(
+            "🤖 Что-то я подвис... попробуй тегнуть меня ещё раз чуть позже.",
+            mention_author=False,
+        )
+        return True
+
+    if not reply:
+        reply = "🤖 ...(потерял мысль). Спроси ещё раз!"
+    history.append({"role": "assistant", "content": reply})
+    await message.reply(reply[:AI_MAX_REPLY], mention_author=False)
+    return True
+
+
 @bot.event
 async def on_message(message: discord.Message):
     # ботов и личные сообщения пропускаем
@@ -1135,6 +1314,17 @@ async def on_message(message: discord.Message):
         print(f"[Автомод] Ошибка: {exc}")
     if handled:
         return
+
+    # Если упомянули бота (и это не команда) — отвечает ИИ-собеседник.
+    content = (message.content or "").strip()
+    is_command = isinstance(PREFIX, str) and bool(PREFIX) and content.startswith(PREFIX)
+    if bot.user in message.mentions and not message.mention_everyone and not is_command:
+        try:
+            if await maybe_ai_reply(message):
+                return
+        except Exception as exc:  # ИИ не должен ронять обработку команд
+            print(f"[ИИ] Непредвиденная ошибка: {exc}")
+
     await bot.process_commands(message)
 
 
@@ -1391,6 +1581,288 @@ async def automod_exempt_role(ctx, role: discord.Role):
         await ctx.reply(f"➕ Роль {role.mention} получила иммунитет к автомоду.")
 
 
+# ---------------------------------------------------------------------------
+# Команды ИИ-собеседника
+# ---------------------------------------------------------------------------
+_TRUE_WORDS = {"вкл", "включить", "on", "да", "true", "1", "включи"}
+_FALSE_WORDS = {"выкл", "выключить", "off", "нет", "false", "0", "выключи"}
+
+
+@bot.command(name="ии")
+@admin_only()
+async def ai_toggle(ctx, mode: str = None):
+    """!ии [вкл|выкл] — включить/выключить ИИ-собеседника (без аргумента — переключить)."""
+    gdata = storage.guild(ctx.guild.id)
+    ai = gdata["ai"]
+    if mode is None:
+        ai["enabled"] = not ai["enabled"]
+    elif mode.lower() in _TRUE_WORDS:
+        ai["enabled"] = True
+    elif mode.lower() in _FALSE_WORDS:
+        ai["enabled"] = False
+    else:
+        await ctx.reply("❌ Используйте `!ии вкл` или `!ии выкл`.")
+        return
+    storage.save()
+    state = "включён 🟢" if ai["enabled"] else "выключен 🔴"
+    note = "" if AI_API_KEY else "\n⚠️ Не задан `AI_API_KEY` — отвечать пока не смогу."
+    await ctx.reply(
+        f"🤖 ИИ-собеседник теперь **{state}**. Упомяните меня в чате, чтобы поболтать.{note}"
+    )
+
+
+@bot.command(name="ии_имя")
+@admin_only()
+async def ai_persona(ctx, *, name: str = None):
+    """!ии_имя <имя> — задать имя/образ персонажа для role play (без аргумента — сброс)."""
+    gdata = storage.guild(ctx.guild.id)
+    if not name or not name.strip():
+        gdata["ai"]["persona"] = None
+        storage.save()
+        await ctx.reply(f"🤖 Имя персонажа сброшено на «{AI_PERSONA_NAME}».")
+        return
+    persona = name.strip()[:100]
+    gdata["ai"]["persona"] = persona
+    storage.save()
+    await ctx.reply(f"🤖 Теперь я отыгрываю персонажа: **{persona}**. Тегните меня — проверим!")
+
+
+@bot.command(name="забудь")
+async def ai_forget(ctx):
+    """Очистить память ИИ-разговора в текущем канале."""
+    _ai_history.pop(ctx.channel.id, None)
+    await ctx.reply("🧠 Историю разговора в этом канале очистил — начинаем с чистого листа.")
+
+
+# ---------------------------------------------------------------------------
+# Погода (Open-Meteo — бесплатно, без API-ключа)
+# ---------------------------------------------------------------------------
+# Коды погоды WMO -> (описание, эмодзи)
+WEATHER_CODES = {
+    0: ("Ясно", "☀️"),
+    1: ("Преимущественно ясно", "🌤️"),
+    2: ("Переменная облачность", "⛅"),
+    3: ("Пасмурно", "☁️"),
+    45: ("Туман", "🌫️"),
+    48: ("Изморозь", "🌫️"),
+    51: ("Слабая морось", "🌦️"),
+    53: ("Морось", "🌦️"),
+    55: ("Сильная морось", "🌧️"),
+    56: ("Ледяная морось", "🌧️"),
+    57: ("Сильная ледяная морось", "🌧️"),
+    61: ("Небольшой дождь", "🌦️"),
+    63: ("Дождь", "🌧️"),
+    65: ("Сильный дождь", "🌧️"),
+    66: ("Ледяной дождь", "🌧️"),
+    67: ("Сильный ледяной дождь", "🌧️"),
+    71: ("Небольшой снег", "🌨️"),
+    73: ("Снег", "🌨️"),
+    75: ("Сильный снег", "❄️"),
+    77: ("Снежная крупа", "🌨️"),
+    80: ("Ливень", "🌦️"),
+    81: ("Сильный ливень", "🌧️"),
+    82: ("Очень сильный ливень", "⛈️"),
+    85: ("Снегопад", "🌨️"),
+    86: ("Сильный снегопад", "❄️"),
+    95: ("Гроза", "⛈️"),
+    96: ("Гроза с градом", "⛈️"),
+    99: ("Сильная гроза с градом", "⛈️"),
+}
+
+
+@bot.command(name="погода")
+async def weather_cmd(ctx, *, city: str = None):
+    """!погода <город> — текущая погода и прогноз на день."""
+    if not city or not city.strip():
+        await ctx.reply("🌦️ Укажите город: `!погода Москва`")
+        return
+    city = city.strip()
+    session = await get_http_session()
+    try:
+        async with session.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": city, "count": 1, "language": "ru", "format": "json"},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            geo = await r.json(content_type=None)
+        results = (geo or {}).get("results") or []
+        if not results:
+            await ctx.reply(f"❌ Город «{city}» не найден. Проверьте название и попробуйте снова.")
+            return
+        loc = results[0]
+        lat, lon = loc["latitude"], loc["longitude"]
+        async with session.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
+                "daily": "temperature_2m_max,temperature_2m_min",
+                "timezone": "auto",
+                "forecast_days": 1,
+            },
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            data = await r.json(content_type=None)
+    except Exception as exc:
+        print(f"[Погода] Ошибка: {exc}")
+        await ctx.reply("⚠️ Сервис погоды сейчас недоступен, попробуйте позже.")
+        return
+
+    cur = (data or {}).get("current", {})
+    daily = (data or {}).get("daily", {})
+    code = int(cur.get("weather_code", 0) or 0)
+    desc, emoji = WEATHER_CODES.get(code, ("Неизвестно", "🌡️"))
+    place = ", ".join(p for p in (loc.get("name"), loc.get("admin1"), loc.get("country")) if p)
+
+    embed = discord.Embed(
+        title=f"{emoji} Погода: {place}",
+        description=f"**{desc}**",
+        color=Colors.PRIMARY,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="🌡️ Температура", value=f"{cur.get('temperature_2m', '?')}°C")
+    embed.add_field(name="🤔 Ощущается", value=f"{cur.get('apparent_temperature', '?')}°C")
+    embed.add_field(name="💧 Влажность", value=f"{cur.get('relative_humidity_2m', '?')}%")
+    embed.add_field(name="💨 Ветер", value=f"{cur.get('wind_speed_10m', '?')} км/ч")
+    tmax = (daily.get("temperature_2m_max") or [None])[0]
+    tmin = (daily.get("temperature_2m_min") or [None])[0]
+    if tmax is not None and tmin is not None:
+        embed.add_field(name="📈 Макс / 📉 Мин", value=f"{tmax}°C / {tmin}°C")
+    brand(embed, ctx.guild)
+    await ctx.reply(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# Развлечения и утилиты
+# ---------------------------------------------------------------------------
+@bot.command(name="мем")
+async def meme_cmd(ctx, subreddit: str = None):
+    """!мем [сабреддит] — случайный мем (по умолчанию из популярных)."""
+    session = await get_http_session()
+    url = "https://meme-api.com/gimme"
+    if subreddit:
+        url += "/" + re.sub(r"[^A-Za-z0-9_]", "", subreddit)[:50]
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            data = await r.json(content_type=None)
+    except Exception as exc:
+        print(f"[Мем] Ошибка: {exc}")
+        await ctx.reply("⚠️ Не удалось раздобыть мем, попробуйте ещё раз.")
+        return
+    if not isinstance(data, dict) or data.get("code") or not data.get("url"):
+        await ctx.reply("❌ Мемы не найдены (возможно, неверный сабреддит).")
+        return
+    if data.get("nsfw"):
+        await ctx.reply("🔞 Попался NSFW-мем — пропустил. Попробуйте ещё раз.")
+        return
+    embed = discord.Embed(
+        title=_clip(data.get("title", "Мем"), 256),
+        url=data.get("postLink"),
+        color=Colors.LIGHT,
+    )
+    embed.set_image(url=data["url"])
+    embed.set_footer(text=f"r/{data.get('subreddit', 'memes')} • 👍 {data.get('ups', 0)}")
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="аватар", aliases=["ава"])
+async def avatar_cmd(ctx, member: discord.Member = None):
+    """!аватар [@участник] — показать аватар."""
+    member = member or ctx.author
+    embed = discord.Embed(title=f"🖼️ Аватар — {member.display_name}", color=Colors.PRIMARY)
+    embed.set_image(url=member.display_avatar.url)
+    brand(embed, ctx.guild)
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="юзер", aliases=["профиль"])
+async def userinfo_cmd(ctx, member: discord.Member = None):
+    """!юзер [@участник] — информация об участнике."""
+    member = member or ctx.author
+    color = member.color if member.color.value else Colors.PRIMARY
+    embed = discord.Embed(title=f"👤 {member}", color=color)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="ID", value=str(member.id))
+    embed.add_field(name="Ник", value=member.display_name)
+    embed.add_field(name="Бот", value="да" if member.bot else "нет")
+    if member.created_at:
+        embed.add_field(name="Аккаунт создан", value=f"<t:{int(member.created_at.timestamp())}:R>")
+    if member.joined_at:
+        embed.add_field(name="Зашёл на сервер", value=f"<t:{int(member.joined_at.timestamp())}:R>")
+    roles = [r.mention for r in reversed(member.roles) if r.name != "@everyone"]
+    embed.add_field(
+        name=f"Роли ({len(roles)})",
+        value=(", ".join(roles[:15]) + (" …" if len(roles) > 15 else "")) or "нет",
+        inline=False,
+    )
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="сервер", aliases=["сервак"])
+async def serverinfo_cmd(ctx):
+    """!сервер — информация о сервере."""
+    g = ctx.guild
+    embed = discord.Embed(title=f"🏠 {g.name}", color=Colors.PRIMARY)
+    if g.icon:
+        embed.set_thumbnail(url=g.icon.url)
+    embed.add_field(name="ID", value=str(g.id))
+    embed.add_field(name="Владелец", value=f"<@{g.owner_id}>")
+    embed.add_field(name="Участников", value=str(g.member_count))
+    embed.add_field(name="Каналов", value=str(len(g.channels)))
+    embed.add_field(name="Ролей", value=str(len(g.roles)))
+    if g.created_at:
+        embed.add_field(name="Создан", value=f"<t:{int(g.created_at.timestamp())}:R>")
+    brand(embed, g)
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="кости", aliases=["ролл", "дайс"])
+async def dice_cmd(ctx, spec: str = "1d6"):
+    """!кости 2d6 — бросить кубики (кол-во d граней)."""
+    m = re.fullmatch(r"\s*(\d{1,2})?\s*[dдк]\s*(\d{1,4})\s*", spec, re.IGNORECASE)
+    if not m:
+        await ctx.reply("🎲 Формат: `!кости 2d6` — два кубика по 6 граней.")
+        return
+    count = int(m.group(1) or 1)
+    sides = int(m.group(2))
+    if not (1 <= count <= 20) or not (2 <= sides <= 1000):
+        await ctx.reply("🎲 От 1 до 20 кубиков и от 2 до 1000 граней.")
+        return
+    rolls = [random.randint(1, sides) for _ in range(count)]
+    total = sum(rolls)
+    detail = f" ({' + '.join(map(str, rolls))})" if count > 1 else ""
+    await ctx.reply(f"🎲 Выпало: **{total}**{detail}")
+
+
+_EIGHTBALL = [
+    "Бесспорно ✅", "Мне кажется — да", "Точно да", "Можешь не сомневаться",
+    "Скорее всего", "Хорошие перспективы", "Да", "Знаки говорят «да»",
+    "Пока неясно, попробуй ещё раз", "Спроси позже", "Лучше не рассказывать сейчас",
+    "Сконцентрируйся и спроси опять", "Даже не думай ❌", "Мой ответ — нет",
+    "По моим данным — нет", "Перспективы не очень", "Весьма сомнительно",
+]
+
+
+@bot.command(name="шар", aliases=["8шар", "8ball"])
+async def eightball_cmd(ctx, *, question: str = None):
+    """!шар <вопрос> — магический шар предсказаний."""
+    if not question or not question.strip():
+        await ctx.reply("🎱 Задайте вопрос: `!шар Сегодня будет хороший день?`")
+        return
+    await ctx.reply(f"🎱 {random.choice(_EIGHTBALL)}")
+
+
+@bot.command(name="выбери", aliases=["choose", "выбор"])
+async def choose_cmd(ctx, *, options: str = None):
+    """!выбери вариант1 | вариант2 | ... — бот выберет один из вариантов."""
+    variants = [o.strip() for o in (options or "").split("|") if o.strip()]
+    if len(variants) < 2:
+        await ctx.reply("🤔 Дайте варианты через `|`: `!выбери пицца | суши | шаурма`")
+        return
+    await ctx.reply(f"🤔 Я выбираю: **{random.choice(variants)}**")
+
+
 @bot.command(name="помощь")
 async def help_cmd(ctx):
     embed = discord.Embed(title="📖 Команды бота", color=Colors.PRIMARY)
@@ -1428,6 +1900,28 @@ async def help_cmd(ctx):
             "`!канал_модлогов <#канал>` — канал логов модерации/автомода\n"
             "`!автомод_иммунитет <@роль>` — выдать/убрать иммунитет роли\n"
             "Авто-мут за спам и за приглашения Discord (ссылки discord.gg)"
+        ),
+        inline=False,
+    )
+    mention = bot.user.mention if bot.user else "@бот"
+    embed.add_field(
+        name="🧠 ИИ-собеседник (role play)",
+        value=(
+            f"Упомяните меня ({mention}) в чате — отвечу как ролевой персонаж, "
+            "который шарит за мемы 😎\n"
+            "`!ии [вкл|выкл]` — вкл/выкл ИИ-собеседника (администрация)\n"
+            "`!ии_имя <имя>` — сменить образ персонажа (администрация)\n"
+            "`!забудь` — очистить память разговора в канале"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🎉 Развлечения и утилиты",
+        value=(
+            "`!погода <город>` — прогноз погоды\n"
+            "`!мем [сабреддит]` — случайный мем\n"
+            "`!аватар [@]` • `!юзер [@]` • `!сервер` — информация\n"
+            "`!кости 2d6` • `!шар <вопрос>` • `!выбери a | b` — веселье"
         ),
         inline=False,
     )

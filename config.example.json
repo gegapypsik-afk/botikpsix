@@ -2,5 +2,9 @@
   "token": "ВСТАВЬТЕ_СЮДА_ТОКЕН_ТОЛЬКО_ДЛЯ_ЛОКАЛЬНОГО_ЗАПУСКА",
   "prefix": "!",
   "brand_name": "yooma.su",
-  "brand_url": "https://yooma.su"
+  "brand_url": "https://yooma.su",
+  "ai_api_key": "",
+  "ai_base_url": "https://api.openai.com/v1",
+  "ai_model": "gpt-4o-mini",
+  "ai_bot_name": "Ботя"
 }

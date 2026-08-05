@@ -190,6 +190,7 @@ def _default_guild():
         "open_tickets": {},           # {channel_id: {...}}
         "automod": copy.deepcopy(DEFAULT_AUTOMOD),
         "ai": copy.deepcopy(DEFAULT_AI),
+        "warns": {},                  # предупреждения: {user_id: [{mod_id, reason, ts}, ...]}
     }
 
 
@@ -1025,23 +1026,32 @@ def staff_only():
     return commands.check(predicate)
 
 
+def _moderation_block_reason(guild: discord.Guild, author: discord.Member,
+                             member: discord.Member):
+    """Причина, по которой нельзя наказать участника, либо None если можно.
+
+    Вынесено отдельно, чтобы одну и ту же проверку иерархии использовали и
+    текстовые команды (через can_moderate), и кнопки выбора наказания.
+    """
+    if member.id == author.id:
+        return "❌ Нельзя применить это к самому себе."
+    if member.id == guild.me.id:
+        return "❌ Нельзя применить это ко мне 🙂"
+    if member.id == guild.owner_id:
+        return "❌ Нельзя наказать владельца сервера."
+    if author.id != guild.owner_id and member.top_role >= author.top_role:
+        return "❌ У этого участника роль выше или равна вашей."
+    if member.top_role >= guild.me.top_role:
+        return ("❌ Роль участника выше моей — не могу его наказать. "
+                "Поднимите роль бота выше в настройках сервера.")
+    return None
+
+
 async def can_moderate(ctx, member: discord.Member) -> bool:
     """Проверка иерархии перед наказанием. Возвращает True, если можно."""
-    if member.id == ctx.author.id:
-        await ctx.reply("❌ Нельзя применить это к самому себе.")
-        return False
-    if member.id == ctx.guild.me.id:
-        await ctx.reply("❌ Нельзя применить это ко мне 🙂")
-        return False
-    if member.id == ctx.guild.owner_id:
-        await ctx.reply("❌ Нельзя наказать владельца сервера.")
-        return False
-    if ctx.author.id != ctx.guild.owner_id and member.top_role >= ctx.author.top_role:
-        await ctx.reply("❌ У этого участника роль выше или равна вашей.")
-        return False
-    if member.top_role >= ctx.guild.me.top_role:
-        await ctx.reply("❌ Роль участника выше моей — не могу его наказать. "
-                        "Поднимите роль бота выше в настройках сервера.")
+    reason = _moderation_block_reason(ctx.guild, ctx.author, member)
+    if reason:
+        await ctx.reply(reason)
         return False
     return True
 
@@ -1215,8 +1225,16 @@ def _ai_system_prompt(persona: str, guild_name: str) -> str:
     )
 
 
+class AIError(RuntimeError):
+    """Ошибка запроса к ИИ-провайдеру. Несёт HTTP-статус, если он известен."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
 async def ask_ai(messages: list) -> str:
-    """Запрос к OpenAI-совместимому Chat Completions API. Бросает исключение при ошибке."""
+    """Запрос к OpenAI-совместимому Chat Completions API. Бросает AIError при ошибке."""
     session = await get_http_session()
     payload = {
         "model": AI_MODEL,
@@ -1239,11 +1257,11 @@ async def ask_ai(messages: list) -> str:
             if isinstance(data, dict):
                 err = data.get("error")
                 detail = err.get("message") if isinstance(err, dict) else str(err or "")
-            raise RuntimeError(detail or f"HTTP {resp.status}")
+            raise AIError(detail or f"HTTP {resp.status}", status=resp.status)
         try:
             return (data["choices"][0]["message"]["content"] or "").strip()
         except (KeyError, IndexError, TypeError):
-            raise RuntimeError("Пустой или неожиданный ответ от ИИ-провайдера.")
+            raise AIError("Пустой или неожиданный ответ от ИИ-провайдера.")
 
 
 def _strip_bot_mention(message: discord.Message) -> str:
@@ -1293,13 +1311,30 @@ async def maybe_ai_reply(message: discord.Message) -> bool:
         async with message.channel.typing():
             reply = await ask_ai(conversation)
     except Exception as exc:
-        print(f"[ИИ] Ошибка запроса: {exc}")
+        status = getattr(exc, "status", None)
+        # Печатаем в лог реальную причину (видно в Railway → View logs).
+        print(f"[ИИ] Ошибка запроса (status={status}): {exc}")
         if history and history[-1]["role"] == "user":
             history.pop()  # откатываем незавершённую реплику
-        await message.reply(
-            "🤖 Что-то я подвис... попробуй тегнуть меня ещё раз чуть позже.",
-            mention_author=False,
-        )
+        # Постоянные ошибки (ключ/баланс/доступ) повтором не лечатся — говорим прямо.
+        permanent = {
+            401: "ключ ИИ неверный или просрочен",
+            402: "на балансе ИИ-провайдера закончились средства",
+            403: "провайдер отклонил запрос (проверьте ключ, модель и адрес API)",
+            404: "модель или адрес API не найдены (проверьте `AI_MODEL` и `AI_BASE_URL`)",
+        }
+        if status in permanent:
+            await message.reply(
+                f"🤖 ИИ сейчас недоступен: {permanent[status]}. "
+                "Админу нужно проверить переменные окружения `AI_API_KEY`, "
+                "`AI_BASE_URL`, `AI_MODEL` и баланс провайдера.",
+                mention_author=False,
+            )
+        else:
+            await message.reply(
+                "🤖 Что-то я подвис... попробуй тегнуть меня ещё раз чуть позже.",
+                mention_author=False,
+            )
         return True
 
     if not reply:
@@ -1554,6 +1589,250 @@ async def unmute_cmd(ctx, member: discord.Member, *, reason: str = "Причин
     embed = _mod_embed("🔊 Мут снят", Colors.LIGHT, member, ctx.author, reason)
     await ctx.reply(embed=embed)
     await mod_log(ctx.guild, storage.guild(ctx.guild.id), embed)
+
+
+# ---- Предупреждения (варны) ------------------------------------------------
+WARN_LIMIT = 3  # столько предупреждений = бот предлагает выдать наказание
+
+
+def _warns_list(gdata: dict, user_id: int) -> list:
+    """Список предупреждений участника (создаётся при первом обращении)."""
+    return gdata.setdefault("warns", {}).setdefault(str(user_id), [])
+
+
+class WarnMuteModal(discord.ui.Modal, title="Мут за предупреждения"):
+    """Спрашивает длительность мута, когда модератор выбрал «Мут» как наказание."""
+
+    def __init__(self, parent: "PunishmentView"):
+        super().__init__()
+        self.parent = parent
+        self.duration = discord.ui.TextInput(
+            label="Длительность (напр. 30м, 2ч, 1д)",
+            default="1ч", max_length=10,
+        )
+        self.reason = discord.ui.TextInput(
+            label="Причина", required=False,
+            default=f"{WARN_LIMIT} предупреждения", max_length=200,
+        )
+        self.add_item(self.duration)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        seconds = parse_duration(str(self.duration.value))
+        if not seconds or seconds <= 0:
+            await interaction.response.send_message(
+                "❌ Неверная длительность. Примеры: `30с`, `10м`, `2ч`, `1д`.",
+                ephemeral=True,
+            )
+            return
+        seconds = min(seconds, MAX_TIMEOUT_SECONDS)
+        reason = str(self.reason.value) or f"{WARN_LIMIT} предупреждения"
+        try:
+            await self.parent.member.timeout(
+                timedelta(seconds=seconds),
+                reason=f"{self.parent.moderator}: {reason}",
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ У меня нет права «Тайм-аут участникам» или роль бота слишком низкая.",
+                ephemeral=True,
+            )
+            return
+        embed = _mod_embed(
+            f"🔇 Мут за {WARN_LIMIT} предупреждения", Colors.ACCENT,
+            self.parent.member, self.parent.moderator, reason,
+            extra=("Длительность", format_duration(seconds)),
+        )
+        await interaction.response.send_message(embed=embed)
+        await self.parent.finish(interaction.guild, embed)
+
+
+class PunishmentView(discord.ui.View):
+    """Предлагает модератору выбрать наказание, когда набрано WARN_LIMIT варнов."""
+
+    def __init__(self, member: discord.Member, moderator: discord.Member, gdata: dict):
+        super().__init__(timeout=180)
+        self.member = member
+        self.moderator = moderator
+        self.gdata = gdata
+        self.message: discord.Message | None = None
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        # Наказание выбирает только тот модератор, что выдал третий варн.
+        if interaction.user.id != self.moderator.id:
+            await interaction.response.send_message(
+                "⛔ Наказание выбирает модератор, выдавший предупреждение.",
+                ephemeral=True,
+            )
+            return False
+        block = _moderation_block_reason(interaction.guild, self.moderator, self.member)
+        if block:
+            await interaction.response.send_message(block, ephemeral=True)
+            return False
+        return True
+
+    def _disable(self):
+        for item in self.children:
+            item.disabled = True
+
+    async def finish(self, guild: discord.Guild, embed: discord.Embed):
+        """Сбрасываем варны, гасим кнопки и пишем в модлог после наказания."""
+        self.gdata.setdefault("warns", {}).pop(str(self.member.id), None)
+        storage.save()
+        self._disable()
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+        self.stop()
+        await mod_log(guild, self.gdata, embed)
+
+    async def on_timeout(self):
+        self._disable()
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Мут", emoji="🔇", style=discord.ButtonStyle.secondary)
+    async def mute_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        await interaction.response.send_modal(WarnMuteModal(self))
+
+    @discord.ui.button(label="Бан", emoji="🔨", style=discord.ButtonStyle.danger)
+    async def ban_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        reason = f"{WARN_LIMIT} предупреждения (модератор {self.moderator})"
+        try:
+            await self.member.ban(reason=reason, delete_message_seconds=0)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ У меня нет права «Банить участников» или роль бота слишком низкая.",
+                ephemeral=True,
+            )
+            return
+        embed = _mod_embed(f"🔨 Бан за {WARN_LIMIT} предупреждения", Colors.DANGER,
+                           self.member, self.moderator, reason)
+        await interaction.response.send_message(embed=embed)
+        await self.finish(interaction.guild, embed)
+
+    @discord.ui.button(label="Кик", emoji="👢", style=discord.ButtonStyle.primary)
+    async def kick_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        reason = f"{WARN_LIMIT} предупреждения (модератор {self.moderator})"
+        try:
+            await self.member.kick(reason=reason)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ У меня нет права «Выгонять участников» или роль бота слишком низкая.",
+                ephemeral=True,
+            )
+            return
+        embed = _mod_embed(f"👢 Кик за {WARN_LIMIT} предупреждения", Colors.ACCENT,
+                           self.member, self.moderator, reason)
+        await interaction.response.send_message(embed=embed)
+        await self.finish(interaction.guild, embed)
+
+
+@bot.command(name="варн", aliases=["предупредить", "warn"])
+@staff_only()
+async def warn_cmd(ctx, member: discord.Member, *, reason: str = "Причина не указана"):
+    """!варн @участник [причина] — выдать предупреждение (поддержка)."""
+    if not await can_moderate(ctx, member):
+        return
+    gdata = storage.guild(ctx.guild.id)
+    warns = _warns_list(gdata, member.id)
+    warns.append({
+        "mod_id": ctx.author.id,
+        "reason": reason,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
+    count = len(warns)
+    storage.save()
+
+    # Пытаемся уведомить участника в ЛС (не критично, если закрыты).
+    try:
+        await member.send(
+            f"⚠️ Вам выдали предупреждение на сервере **{ctx.guild.name}** "
+            f"({count}/{WARN_LIMIT}). Причина: {reason}"
+        )
+    except discord.HTTPException:
+        pass
+
+    reached = count >= WARN_LIMIT
+    embed = _mod_embed(
+        "⚠️ Выдано предупреждение", Colors.DANGER if reached else Colors.ACCENT,
+        member, ctx.author, reason, extra=("Предупреждений", f"{count}/{WARN_LIMIT}"),
+    )
+    if reached:
+        embed.add_field(
+            name="Порог достигнут",
+            value=("Набрано максимум предупреждений. "
+                   "Выберите наказание кнопкой ниже 👇"),
+            inline=False,
+        )
+        view = PunishmentView(member, ctx.author, gdata)
+        view.message = await ctx.reply(embed=embed, view=view)
+    else:
+        await ctx.reply(embed=embed)
+    await mod_log(ctx.guild, gdata, embed)
+
+
+@bot.command(name="варны", aliases=["предупреждения", "warns"])
+@staff_only()
+async def warns_cmd(ctx, member: discord.Member = None):
+    """!варны [@участник] — показать предупреждения участника (поддержка)."""
+    member = member or ctx.author
+    gdata = storage.guild(ctx.guild.id)
+    warns = gdata.get("warns", {}).get(str(member.id), [])
+    embed = discord.Embed(
+        title=f"⚠️ Предупреждения — {member.display_name}",
+        color=Colors.ACCENT, timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Всего", value=f"{len(warns)}/{WARN_LIMIT}", inline=False)
+    if warns:
+        lines = []
+        for i, w in enumerate(warns, 1):
+            mod = ctx.guild.get_member(w.get("mod_id"))
+            mod_txt = mod.mention if mod else f"`{w.get('mod_id')}`"
+            date = str(w.get("ts", ""))[:10]
+            lines.append(f"**{i}.** {w.get('reason', '—')} — {mod_txt} ({date})")
+        embed.add_field(name="Список", value="\n".join(lines)[:1024], inline=False)
+    brand(embed, ctx.guild)
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="снятьварн", aliases=["снять_варн", "unwarn"])
+@staff_only()
+async def unwarn_cmd(ctx, member: discord.Member, amount: str = "1"):
+    """!снятьварн @участник [кол-во|все] — снять предупреждения (поддержка)."""
+    gdata = storage.guild(ctx.guild.id)
+    warns = gdata.get("warns", {}).get(str(member.id), [])
+    if not warns:
+        await ctx.reply(f"ℹ️ У {member.mention} нет предупреждений.")
+        return
+    if amount.lower() in ("все", "всё", "all"):
+        n = len(warns)
+    else:
+        try:
+            n = max(1, min(len(warns), int(amount)))
+        except ValueError:
+            await ctx.reply("❌ Укажите число или «все». Пример: `!снятьварн @участник 2`.")
+            return
+    del warns[len(warns) - n:]
+    if not warns:
+        gdata["warns"].pop(str(member.id), None)
+    storage.save()
+    left = len(gdata.get("warns", {}).get(str(member.id), []))
+    embed = _mod_embed("♻️ Предупреждения сняты", Colors.LIGHT, member, ctx.author,
+                       f"Снято: {n}", extra=("Осталось", f"{left}/{WARN_LIMIT}"))
+    await ctx.reply(embed=embed)
+    await mod_log(ctx.guild, gdata, embed)
 
 
 # ---- Команды автомода ------------------------------------------------------
@@ -1903,7 +2182,11 @@ async def help_cmd(ctx):
             "`!разбан <ID> [причина]` — разбанить (администрация)\n"
             "`!кик @участник [причина]` — кикнуть (администрация)\n"
             "`!мут @участник <время> [причина]` — мут (поддержка), напр. `10м`, `2ч`, `1д`\n"
-            "`!размут @участник [причина]` — снять мут (поддержка)"
+            "`!размут @участник [причина]` — снять мут (поддержка)\n"
+            "`!варн @участник [причина]` — предупреждение (поддержка); "
+            f"на {WARN_LIMIT}-м бот предложит мут/бан/кик\n"
+            "`!варны [@участник]` — показать предупреждения\n"
+            "`!снятьварн @участник [кол-во|все]` — снять предупреждения"
         ),
         inline=False,
     )

@@ -1295,6 +1295,46 @@ AI_PURPOSES = {
 # Понятные подписи целей для вывода в чат.
 AI_PURPOSE_LABELS = {"chat": "💬 Чат", "coding": "💻 Кодинг", "image": "🎨 Картинки"}
 
+# Системный промпт для «кодинг»-режима — используется и командой !код, и авто-роутингом.
+AI_CODING_SYSTEM = (
+    "Ты — опытный senior-программист и помощник по коду. Отвечай по делу и практично, "
+    "на русском языке. Приводи рабочие примеры кода в блоках ``` с указанием языка, "
+    "кратко поясняй решение и подводные камни. Без лишней воды."
+)
+
+# Ключевые слова для авто-определения цели по тексту упоминания бота. Если сработали —
+# бот сам подставит модель под задачу (код/картинка), не заставляя звать !код/!картинка.
+_AI_IMAGE_HINTS = (
+    "нарисуй", "нарисовать", "нарисуешь", "картинк", "изображени", "рисунок", "срисуй",
+    "сгенерируй фото", "сгенерируй картин", "сгенерируй изображени", "сгенерируй арт",
+    "логотип", "обои", "wallpaper", "draw ", "picture of", "image of",
+)
+_AI_CODE_HINTS = (
+    "код", "кодинг", "напиши функци", "напиши программ", "напиши скрипт", "скрипт",
+    "функцию на", "ошибка в коде", "почини код", "отладь", "traceback", "стектрейс",
+    "python", "питон", "javascript", "джаваскрипт", "typescript", "react", "html", "css",
+    "sql-запрос", "регулярк", "regex", "алгоритм", "рефактор", "дебаг", "debug",
+)
+
+
+def detect_ai_purpose(text: str) -> str:
+    """Определяет цель запроса (chat/coding/image), чтобы бот сам выбрал модель.
+
+    Правила простые и предсказуемые: блок ``` или код-слова → coding,
+    слова про рисование → image, иначе — обычный чат. Картинки проверяем раньше
+    кода, чтобы «нарисуй схему кода» уходило в генерацию изображения.
+    """
+    if not text:
+        return "chat"
+    if "```" in text:
+        return "coding"
+    low = text.lower()
+    if any(w in low for w in _AI_IMAGE_HINTS):
+        return "image"
+    if any(w in low for w in _AI_CODE_HINTS):
+        return "coding"
+    return "chat"
+
 
 def get_ai_model(gdata: dict, purpose: str = "chat") -> str:
     """Модель под конкретную цель: сначала настройка сервера, затем окружение."""
@@ -1308,36 +1348,84 @@ def get_ai_model(gdata: dict, purpose: str = "chat") -> str:
     return AI_MODEL
 
 
+async def _ai_request(url: str, payload: dict, *, timeout: int = 90) -> dict:
+    """POST к OpenAI-совместимому API с понятными ошибками.
+
+    Возвращает разобранный JSON при HTTP 200. Иначе бросает AIError с осмысленным
+    текстом и (если известен) HTTP-статусом. Ключевая деталь: тело сначала читается
+    как ТЕКСТ и только потом аккуратно парсится в JSON. Так пустой ответ или HTML
+    (например, страница-заглушка Cloudflare/ngrok, когда локальный OmniRoute
+    недоступен) больше не роняют парсер загадочным «Expecting value: line 1 column 1»,
+    а превращаются в понятное сообщение с реальным статусом и куском тела.
+    """
+    session = await get_http_session()
+    headers = {
+        "Authorization": f"Bearer {AI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with session.post(
+            url, json=payload, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            raw = await resp.text()
+            status = resp.status
+    except asyncio.TimeoutError:
+        raise AIError(
+            "провайдер не ответил вовремя (таймаут). Проверьте, что локальный "
+            "OmniRoute запущен, а туннель из `AI_BASE_URL` доступен.",
+            status=None,
+        )
+    except aiohttp.ClientError as exc:
+        raise AIError(
+            f"не удалось подключиться к `AI_BASE_URL` ({exc.__class__.__name__}). "
+            "Обычно это значит, что локальный OmniRoute выключен или адрес туннеля "
+            "устарел (ссылки trycloudflare.com меняются при каждом перезапуске).",
+            status=None,
+        )
+
+    # Аккуратно пытаемся разобрать JSON — не роняя всё на HTML/пустом теле.
+    body = (raw or "").strip()
+    data = None
+    if body:
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            data = None
+
+    snippet = re.sub(r"\s+", " ", body)[:200] or "пустой ответ"
+
+    if status != 200:
+        detail = ""
+        if isinstance(data, dict):
+            err = data.get("error")
+            detail = err.get("message") if isinstance(err, dict) else str(err or "")
+        raise AIError(detail or f"HTTP {status}, тело: {snippet}", status=status)
+
+    if data is None:
+        # Успешный по статусу, но не-JSON ответ — почти всегда заглушка туннеля.
+        raise AIError(
+            f"провайдер вернул не-JSON ответ (HTTP 200): {snippet}. Похоже на "
+            "страницу-заглушку туннеля — проверьте `AI_BASE_URL` и что OmniRoute запущен.",
+            status=200,
+        )
+    return data
+
+
 async def ask_ai(messages: list, model: str = None, *,
                  temperature: float = 0.9, max_tokens: int = 500) -> str:
     """Запрос к OpenAI-совместимому Chat Completions API. Бросает AIError при ошибке."""
-    session = await get_http_session()
     payload = {
         "model": model or AI_MODEL,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    headers = {
-        "Authorization": f"Bearer {AI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    url = f"{AI_BASE_URL}/chat/completions"
-    async with session.post(
-        url, json=payload, headers=headers,
-        timeout=aiohttp.ClientTimeout(total=90),
-    ) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status != 200:
-            detail = ""
-            if isinstance(data, dict):
-                err = data.get("error")
-                detail = err.get("message") if isinstance(err, dict) else str(err or "")
-            raise AIError(detail or f"HTTP {resp.status}", status=resp.status)
-        try:
-            return (data["choices"][0]["message"]["content"] or "").strip()
-        except (KeyError, IndexError, TypeError):
-            raise AIError("Пустой или неожиданный ответ от ИИ-провайдера.")
+    data = await _ai_request(f"{AI_BASE_URL}/chat/completions", payload, timeout=90)
+    try:
+        return (data["choices"][0]["message"]["content"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        raise AIError("пустой или неожиданный ответ от ИИ-провайдера.")
 
 
 async def ask_ai_image(prompt: str, model: str, *, size: str = "1024x1024"):
@@ -1346,34 +1434,18 @@ async def ask_ai_image(prompt: str, model: str, *, size: str = "1024x1024"):
     Возвращает кортеж (url, raw_bytes): один из элементов может быть None —
     провайдеры отдают либо ссылку, либо base64-данные картинки.
     """
-    session = await get_http_session()
     payload = {"model": model, "prompt": prompt, "n": 1, "size": size}
-    headers = {
-        "Authorization": f"Bearer {AI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    url = f"{AI_BASE_URL}/images/generations"
-    async with session.post(
-        url, json=payload, headers=headers,
-        timeout=aiohttp.ClientTimeout(total=120),
-    ) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status != 200:
-            detail = ""
-            if isinstance(data, dict):
-                err = data.get("error")
-                detail = err.get("message") if isinstance(err, dict) else str(err or "")
-            raise AIError(detail or f"HTTP {resp.status}", status=resp.status)
-        try:
-            item = data["data"][0]
-        except (KeyError, IndexError, TypeError):
-            raise AIError("Провайдер не вернул изображение.")
-        img_url = item.get("url")
-        b64 = item.get("b64_json")
-        raw = base64.b64decode(b64) if b64 else None
-        if not img_url and not raw:
-            raise AIError("Пустой ответ генератора изображений.")
-        return img_url, raw
+    data = await _ai_request(f"{AI_BASE_URL}/images/generations", payload, timeout=120)
+    try:
+        item = data["data"][0]
+    except (KeyError, IndexError, TypeError):
+        raise AIError("провайдер не вернул изображение.")
+    img_url = item.get("url")
+    b64 = item.get("b64_json")
+    raw = base64.b64decode(b64) if b64 else None
+    if not img_url and not raw:
+        raise AIError("пустой ответ генератора изображений.")
+    return img_url, raw
 
 
 # Токен @ник в ответе ИИ: латиница/кириллица, цифры, _ . -
@@ -1422,6 +1494,42 @@ def _strip_bot_mention(message: discord.Message) -> str:
     return content.strip()
 
 
+async def _ai_reply_image(message: discord.Message, gdata: dict, prompt_text: str) -> bool:
+    """Генерирует картинку в ответ на упоминание, когда авто-роутинг распознал такую цель."""
+    model = get_ai_model(gdata, "image")
+    if not model:
+        await message.reply(
+            "🎨 Вижу, ты просишь картинку, но модель для генерации изображений не задана. "
+            "Админ, укажите её командой `!ии_модель картинка <модель>` или переменной "
+            "`AI_IMAGE_MODEL`. Учтите: не у каждого провайдера есть модели генерации "
+            "изображений — например, в OmniRoute/Kiro их может не быть вовсе.",
+            mention_author=False,
+        )
+        return True
+    try:
+        async with message.channel.typing():
+            img_url, raw = await ask_ai_image(prompt_text, model)
+    except Exception as exc:
+        status = getattr(exc, "status", None)
+        print(f"[ИИ/картинка] Ошибка (status={status}): {exc}")
+        await message.reply(_ai_error_text(status, model), mention_author=False)
+        return True
+    embed = discord.Embed(
+        title="🎨 Готово",
+        description=_clip(prompt_text, 400),
+        color=Colors.LIGHT,
+    )
+    embed.set_footer(text=f"{BRAND_NAME} • модель: {model}")
+    if raw is not None:
+        file = discord.File(io.BytesIO(raw), filename="image.png")
+        embed.set_image(url="attachment://image.png")
+        await message.reply(embed=embed, file=file, mention_author=False)
+    else:
+        embed.set_image(url=img_url)
+        await message.reply(embed=embed, mention_author=False)
+    return True
+
+
 async def maybe_ai_reply(message: discord.Message) -> bool:
     """Отвечает как ИИ, если это включено. Возвращает True, если сообщение обработано."""
     gdata = storage.guild(message.guild.id)
@@ -1447,19 +1555,30 @@ async def maybe_ai_reply(message: discord.Message) -> bool:
     prompt_text = _strip_bot_mention(message) or "Привет!"
     persona = ai.get("persona") or AI_PERSONA_NAME
 
+    # Бот сам выбирает модель под задачу: просят картинку — рисуем, код — кодовая
+    # модель (например kr/qwen3-coder-next), иначе — обычная болтовня.
+    purpose = detect_ai_purpose(prompt_text)
+    if purpose == "image":
+        return await _ai_reply_image(message, gdata, prompt_text)
+
     history = _ai_history.setdefault(message.channel.id, [])
     history.append({"role": "user", "content": f"{message.author.display_name}: {prompt_text}"})
     # Держим только последние реплики, чтобы не раздувать контекст.
     if len(history) > AI_HISTORY_TURNS * 2:
         del history[: len(history) - AI_HISTORY_TURNS * 2]
 
-    conversation = [
-        {"role": "system", "content": _ai_system_prompt(persona, message.guild.name)}
-    ] + history
+    # Под кодинг — деловой системный промпт и модель для кода; иначе ролевой персонаж.
+    if purpose == "coding":
+        system_prompt = AI_CODING_SYSTEM
+        gen_kwargs = {"temperature": 0.3, "max_tokens": 1500}
+    else:
+        system_prompt = _ai_system_prompt(persona, message.guild.name)
+        gen_kwargs = {}
+    conversation = [{"role": "system", "content": system_prompt}] + history
 
     try:
         async with message.channel.typing():
-            reply = await ask_ai(conversation, model=get_ai_model(gdata, "chat"))
+            reply = await ask_ai(conversation, model=get_ai_model(gdata, purpose), **gen_kwargs)
     except Exception as exc:
         status = getattr(exc, "status", None)
         # Печатаем в лог реальную причину (видно в Railway → View logs).
@@ -1478,6 +1597,12 @@ async def maybe_ai_reply(message: discord.Message) -> bool:
                 f"🤖 ИИ сейчас недоступен: {permanent[status]}. "
                 "Админу нужно проверить переменные окружения `AI_API_KEY`, "
                 "`AI_BASE_URL`, `AI_MODEL` и баланс провайдера.",
+                mention_author=False,
+            )
+        elif status is None:
+            await message.reply(
+                "🤖 Не могу достучаться до своих «мозгов» — похоже, локальный ИИ (OmniRoute) "
+                "выключен или адрес туннеля `AI_BASE_URL` устарел. Админ, глянь `!ии_тест`.",
                 mention_author=False,
             )
         else:
@@ -2133,6 +2258,41 @@ async def ai_set_model(ctx, purpose: str = None, *, model: str = None):
     )
 
 
+@bot.command(name="ии_тест", aliases=["ai_test", "ии_пинг"])
+@admin_only()
+async def ai_test(ctx):
+    """!ии_тест — проверить связь с ИИ-провайдером и показать точную причину ошибок."""
+    if not AI_API_KEY:
+        await ctx.reply("🤖 `AI_API_KEY` не задан — задайте его в переменных окружения.")
+        return
+    gdata = storage.guild(ctx.guild.id)
+    model = get_ai_model(gdata, "chat")
+    masked = f"{AI_API_KEY[:6]}…{AI_API_KEY[-4:]}" if len(AI_API_KEY) > 12 else "задан"
+    lines = [
+        "🔌 **Проверка подключения к ИИ**",
+        f"• Адрес: `{AI_BASE_URL}/chat/completions`",
+        f"• Ключ: `{masked}`",
+        f"• Модель (чат): `{model}`",
+    ]
+    try:
+        async with ctx.typing():
+            reply = await ask_ai(
+                [{"role": "user", "content": "Ответь одним словом: работает"}],
+                model=model, temperature=0, max_tokens=16,
+            )
+        lines.append(f"✅ Ответ получен: {_clip(reply or '(пусто)', 200)}")
+    except Exception as exc:
+        status = getattr(exc, "status", None)
+        print(f"[ИИ/тест] Ошибка (status={status}): {exc}")
+        lines.append(f"❌ Ошибка (status={status}): {_clip(str(exc), 400)}")
+        lines.append(
+            "Подсказка: `status=None` обычно значит, что локальный OmniRoute выключен "
+            "или адрес туннеля `AI_BASE_URL` устарел (ссылки trycloudflare.com меняются "
+            "при каждом перезапуске)."
+        )
+    await ctx.reply("\n".join(lines))
+
+
 def _ai_error_text(status, model: str) -> str:
     """Понятное сообщение об ошибке запроса к ИИ (для команд !код/!картинка)."""
     permanent = {
@@ -2146,6 +2306,13 @@ def _ai_error_text(status, model: str) -> str:
         return (
             f"🤖 ИИ сейчас недоступен: {permanent[status]}. "
             "Проверьте `AI_API_KEY`, `AI_BASE_URL` и модель."
+        )
+    if status is None:
+        # Нет HTTP-статуса — не достучались до провайдера или пришёл не-JSON ответ.
+        return (
+            "🤖 Не удалось связаться с ИИ-провайдером. Обычно локальный OmniRoute выключен "
+            "или адрес туннеля `AI_BASE_URL` устарел (ссылки trycloudflare.com меняются при "
+            "каждом перезапуске). Проверьте туннель и команду `!ии_тест`."
         )
     return "🤖 Что-то пошло не так при запросе к ИИ. Попробуйте ещё раз чуть позже."
 
@@ -2164,13 +2331,8 @@ async def ai_code_cmd(ctx, *, prompt: str = None):
         return
     gdata = storage.guild(ctx.guild.id)
     model = get_ai_model(gdata, "coding")
-    system = (
-        "Ты — опытный senior-программист и помощник по коду. Отвечай по делу и практично, "
-        "на русском языке. Приводи рабочие примеры кода в блоках ``` с указанием языка, "
-        "кратко поясняй решение и подводные камни. Без лишней воды."
-    )
     messages = [
-        {"role": "system", "content": system},
+        {"role": "system", "content": AI_CODING_SYSTEM},
         {"role": "user", "content": prompt.strip()},
     ]
     try:
@@ -2543,10 +2705,12 @@ async def help_cmd(ctx):
         name="🧠 ИИ-собеседник (role play)",
         value=(
             f"Упомяните меня ({mention}) в чате — отвечу как ролевой персонаж, "
-            "который шарит за мемы 😎 и может тегать участников\n"
+            "который шарит за мемы 😎 и может тегать участников. Если попросите код или "
+            "картинку — сам подберу подходящую модель\n"
             "`!ии [вкл|выкл]` — вкл/выкл ИИ-собеседника (администрация)\n"
             "`!ии_имя <имя>` — сменить образ персонажа (администрация)\n"
             "`!ии_модель <цель> <модель>` — модель под цель: чат/кодинг/картинка (администрация)\n"
+            "`!ии_тест` — проверить связь с ИИ-провайдером (администрация)\n"
             "`!код <вопрос>` — помощь с программированием\n"
             "`!картинка <описание>` — сгенерировать изображение\n"
             "`!забудь` — очистить память разговора в канале"

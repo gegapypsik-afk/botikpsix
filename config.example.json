@@ -6,5 +6,7 @@
   "ai_api_key": "",
   "ai_base_url": "https://api.openai.com/v1",
   "ai_model": "gpt-4o-mini",
+  "ai_model_coding": "",
+  "ai_image_model": "",
   "ai_bot_name": "Ботя"
 }

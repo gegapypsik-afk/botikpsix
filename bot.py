@@ -18,6 +18,10 @@
 - Красивая панель настроек автомода с кнопками-переключателями.
 - ИИ-собеседник: если упомянуть бота (@), он отвечает как ролевой персонаж,
   который шарит за мемы и интернет-культуру (через OpenAI-совместимый API).
+  Отвечает с упоминанием автора и умеет тегать участников (@ник → реальный пинг).
+- Выбор модели ИИ под цель: !ии_модель <чат|кодинг|картинка> <модель>.
+- ИИ-команды: !код (помощь с кодом) и !картинка (генерация изображений).
+- Команда !скажи — отправить сообщение от лица бота (поддержка/администрация).
 - Прогноз погоды по городам командой !погода (бесплатный Open-Meteo, без ключа).
 - Развлечения и утилиты: !мем, !аватар, !юзер, !сервер, !кости, !шар, !выбери.
 - Все команды через префикс "!" и на русском языке.
@@ -32,8 +36,10 @@ import json
 import os
 import copy
 import time
+import base64
 import random
 import asyncio
+from typing import Optional
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
@@ -93,6 +99,11 @@ AI_BASE_URL = (
     or CONFIG.get("ai_base_url", "https://api.openai.com/v1")
 ).rstrip("/")
 AI_MODEL = os.environ.get("AI_MODEL") or CONFIG.get("ai_model", "gpt-4o-mini")
+# Модели по умолчанию под конкретные цели. Если не заданы — берётся AI_MODEL
+# (а для картинок команда попросит указать модель). На сервере их можно
+# переопределить командой !ии_модель <цель> <модель>.
+AI_MODEL_CODING = os.environ.get("AI_MODEL_CODING") or CONFIG.get("ai_model_coding", "")
+AI_IMAGE_MODEL = os.environ.get("AI_IMAGE_MODEL") or CONFIG.get("ai_image_model", "")
 # Имя персонажа по умолчанию (можно переопределить на сервере командой !ии_имя).
 AI_PERSONA_NAME = os.environ.get("AI_BOT_NAME") or CONFIG.get("ai_bot_name", "Ботя")
 
@@ -150,6 +161,16 @@ DEFAULT_CATEGORIES = {
         "emoji": "🛒",
         "description": "Оформить покупку товара",
     },
+    "giveaway": {
+        "label": "Организовать розыгрыш",
+        "emoji": "🎉",
+        "description": "Запросить организацию розыгрыша",
+    },
+    "other": {
+        "label": "Другое",
+        "emoji": "❓",
+        "description": "Другой вопрос или обращение",
+    },
 }
 
 # Настройки автомода по умолчанию
@@ -168,6 +189,13 @@ DEFAULT_AUTOMOD = {
 DEFAULT_AI = {
     "enabled": True,     # отвечает ли бот на упоминания как ИИ
     "persona": None,     # имя/описание персонажа для role play (None = по умолчанию)
+    # Модели под конкретные цели. None = использовать значение из окружения
+    # (AI_MODEL для чата/кода, AI_IMAGE_MODEL для картинок).
+    "models": {
+        "chat": None,       # ответы на упоминания (болтовня, role play)
+        "coding": None,     # команда !код — помощь с программированием
+        "image": None,      # команда !картинка — генерация изображений
+    },
 }
 
 
@@ -185,6 +213,10 @@ def _default_guild():
             "Сотрудники ответят вам в созданном канале."
         ),
         "categories": copy.deepcopy(DEFAULT_CATEGORIES),
+        # Какие категории по умолчанию уже «подсеяны» на сервер. Нужно, чтобы
+        # новые дефолтные категории появлялись при обновлении бота, но при этом
+        # удалённые вручную категории не воскресали.
+        "category_seed": sorted(DEFAULT_CATEGORIES.keys()),
         "ticket_counter": 0,
         "stats": {"created": 0, "closed": 0, "accepted": 0, "by_category": {}},
         "open_tickets": {},           # {channel_id: {...}}
@@ -219,9 +251,13 @@ class Storage:
             self.data["guilds"][gid] = g
             self.save()
             return g
-        # мягкая миграция — добавляем недостающие ключи
+        # мягкая миграция — добавляем недостающие ключи.
+        # "category_seed" обрабатывается отдельно ниже: его нельзя копировать из
+        # дефолта напрямую, иначе новые категории посчитаются уже подсеянными.
         base = _default_guild()
         for k, v in base.items():
+            if k == "category_seed":
+                continue
             if k not in g:
                 g[k] = v
         for k, v in base["stats"].items():
@@ -233,6 +269,18 @@ class Storage:
         for k, v in base["ai"].items():
             if k not in g["ai"]:
                 g["ai"][k] = v
+        # вложенный словарь моделей ИИ — добавляем недостающие цели
+        if not isinstance(g["ai"].get("models"), dict):
+            g["ai"]["models"] = copy.deepcopy(base["ai"]["models"])
+        else:
+            for mk, mv in base["ai"]["models"].items():
+                g["ai"]["models"].setdefault(mk, mv)
+        # подсев новых категорий по умолчанию (без воскрешения удалённых вручную)
+        seeded = g.setdefault("category_seed", list(g.get("categories", {}).keys()))
+        for key, cat in DEFAULT_CATEGORIES.items():
+            if key not in seeded:
+                g.setdefault("categories", {}).setdefault(key, copy.deepcopy(cat))
+                seeded.append(key)
         return g
 
 
@@ -1221,6 +1269,9 @@ def _ai_system_prompt(persona: str, guild_name: str) -> str:
         "национальности, религии, пола и т.п. "
         "Не давай реально опасных, противоправных инструкций и жёсткого NSFW — "
         "если просят такое, отшутись матом и переведи тему. "
+        "Ты можешь тегать (упоминать) участников: просто напиши @их_ник в тексте, "
+        "и упоминание станет настоящим пингом. Обращаясь к человеку, зови его по нику через @. "
+        "Не пиши @everyone и @here — массовые пинги запрещены. "
         "Отвечай на том же языке, на котором к тебе обратились."
     )
 
@@ -1233,14 +1284,39 @@ class AIError(RuntimeError):
         self.status = status
 
 
-async def ask_ai(messages: list) -> str:
+# Цели ИИ и их русские синонимы (для команды !ии_модель).
+AI_PURPOSES = {
+    "chat": "chat", "чат": "chat", "общение": "chat", "болтовня": "chat", "диалог": "chat",
+    "coding": "coding", "код": "coding", "кодинг": "coding", "code": "coding",
+    "программирование": "coding", "прога": "coding",
+    "image": "image", "картинка": "image", "картинки": "image", "изображение": "image",
+    "рисунок": "image", "арт": "image", "img": "image",
+}
+# Понятные подписи целей для вывода в чат.
+AI_PURPOSE_LABELS = {"chat": "💬 Чат", "coding": "💻 Кодинг", "image": "🎨 Картинки"}
+
+
+def get_ai_model(gdata: dict, purpose: str = "chat") -> str:
+    """Модель под конкретную цель: сначала настройка сервера, затем окружение."""
+    chosen = (gdata.get("ai", {}).get("models") or {}).get(purpose)
+    if chosen:
+        return chosen
+    if purpose == "coding":
+        return AI_MODEL_CODING or AI_MODEL
+    if purpose == "image":
+        return AI_IMAGE_MODEL or ""
+    return AI_MODEL
+
+
+async def ask_ai(messages: list, model: str = None, *,
+                 temperature: float = 0.9, max_tokens: int = 500) -> str:
     """Запрос к OpenAI-совместимому Chat Completions API. Бросает AIError при ошибке."""
     session = await get_http_session()
     payload = {
-        "model": AI_MODEL,
+        "model": model or AI_MODEL,
         "messages": messages,
-        "temperature": 0.9,
-        "max_tokens": 500,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
     }
     headers = {
         "Authorization": f"Bearer {AI_API_KEY}",
@@ -1249,7 +1325,7 @@ async def ask_ai(messages: list) -> str:
     url = f"{AI_BASE_URL}/chat/completions"
     async with session.post(
         url, json=payload, headers=headers,
-        timeout=aiohttp.ClientTimeout(total=45),
+        timeout=aiohttp.ClientTimeout(total=90),
     ) as resp:
         data = await resp.json(content_type=None)
         if resp.status != 200:
@@ -1262,6 +1338,80 @@ async def ask_ai(messages: list) -> str:
             return (data["choices"][0]["message"]["content"] or "").strip()
         except (KeyError, IndexError, TypeError):
             raise AIError("Пустой или неожиданный ответ от ИИ-провайдера.")
+
+
+async def ask_ai_image(prompt: str, model: str, *, size: str = "1024x1024"):
+    """Генерация картинки через OpenAI-совместимый /images/generations.
+
+    Возвращает кортеж (url, raw_bytes): один из элементов может быть None —
+    провайдеры отдают либо ссылку, либо base64-данные картинки.
+    """
+    session = await get_http_session()
+    payload = {"model": model, "prompt": prompt, "n": 1, "size": size}
+    headers = {
+        "Authorization": f"Bearer {AI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    url = f"{AI_BASE_URL}/images/generations"
+    async with session.post(
+        url, json=payload, headers=headers,
+        timeout=aiohttp.ClientTimeout(total=120),
+    ) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status != 200:
+            detail = ""
+            if isinstance(data, dict):
+                err = data.get("error")
+                detail = err.get("message") if isinstance(err, dict) else str(err or "")
+            raise AIError(detail or f"HTTP {resp.status}", status=resp.status)
+        try:
+            item = data["data"][0]
+        except (KeyError, IndexError, TypeError):
+            raise AIError("Провайдер не вернул изображение.")
+        img_url = item.get("url")
+        b64 = item.get("b64_json")
+        raw = base64.b64decode(b64) if b64 else None
+        if not img_url and not raw:
+            raise AIError("Пустой ответ генератора изображений.")
+        return img_url, raw
+
+
+# Токен @ник в ответе ИИ: латиница/кириллица, цифры, _ . -
+_MENTION_TOKEN_RE = re.compile(r"@([A-Za-zА-Яа-яЁё0-9_.\-]{2,32})")
+
+
+def linkify_mentions(text: str, guild: discord.Guild) -> str:
+    """Превращает @ник из текста ИИ в настоящие упоминания <@id> участников.
+
+    Массовые пинги (@everyone/@here) намеренно НЕ трогаются, а благодаря
+    allowed_mentions они всё равно не сработают.
+    """
+    if not text or guild is None:
+        return text
+    # Карта «ник в нижнем регистре -> id». Первый совпавший участник побеждает.
+    lookup = {}
+    for m in guild.members:
+        for name in (m.display_name, m.name):
+            if name:
+                lookup.setdefault(name.lower(), m.id)
+
+    def repl(match: "re.Match") -> str:
+        token = match.group(1)
+        if token.lower() in ("everyone", "here"):
+            return match.group(0)
+        uid = lookup.get(token.lower())
+        return f"<@{uid}>" if uid else match.group(0)
+
+    return _MENTION_TOKEN_RE.sub(repl, text)
+
+
+# Упоминания, разрешённые в ответах ИИ: пингуем людей, но не @everyone и не роли.
+AI_ALLOWED_MENTIONS = discord.AllowedMentions(everyone=False, roles=False, users=True)
+
+
+def _split_message(text: str, size: int = 1990):
+    """Режет длинный текст на куски под лимит Discord (2000 символов)."""
+    return [text[i:i + size] for i in range(0, len(text), size)] or [""]
 
 
 def _strip_bot_mention(message: discord.Message) -> str:
@@ -1309,7 +1459,7 @@ async def maybe_ai_reply(message: discord.Message) -> bool:
 
     try:
         async with message.channel.typing():
-            reply = await ask_ai(conversation)
+            reply = await ask_ai(conversation, model=get_ai_model(gdata, "chat"))
     except Exception as exc:
         status = getattr(exc, "status", None)
         # Печатаем в лог реальную причину (видно в Railway → View logs).
@@ -1340,7 +1490,11 @@ async def maybe_ai_reply(message: discord.Message) -> bool:
     if not reply:
         reply = "🤖 ...(потерял мысль). Спроси ещё раз!"
     history.append({"role": "assistant", "content": reply})
-    await message.reply(reply[:AI_MAX_REPLY], mention_author=False)
+    # Тегаем автора в начале ответа и превращаем @ник в настоящие упоминания.
+    out = f"{message.author.mention}, {linkify_mentions(reply, message.guild)}"
+    await message.reply(
+        out[:AI_MAX_REPLY], mention_author=False, allowed_mentions=AI_ALLOWED_MENTIONS,
+    )
     return True
 
 
@@ -1927,6 +2081,155 @@ async def ai_forget(ctx):
     await ctx.reply("🧠 Историю разговора в этом канале очистил — начинаем с чистого листа.")
 
 
+def _ai_models_embed(gdata: dict) -> discord.Embed:
+    """Показывает, какая модель используется под каждую цель."""
+    embed = discord.Embed(
+        title="🧩 Модели ИИ по целям",
+        description=(
+            "Модель под конкретную цель можно задать командой\n"
+            "`!ии_модель <цель> <модель>` (цели: `чат`, `кодинг`, `картинка`).\n"
+            "`!ии_модель <цель> сброс` — вернуть значение по умолчанию."
+        ),
+        color=Colors.PRIMARY,
+    )
+    models = gdata.get("ai", {}).get("models") or {}
+    for purpose, label in AI_PURPOSE_LABELS.items():
+        override = models.get(purpose)
+        effective = get_ai_model(gdata, purpose) or "— не задана —"
+        source = "настройка сервера" if override else "по умолчанию"
+        embed.add_field(name=label, value=f"`{effective}`\n_({source})_", inline=True)
+    brand(embed)
+    return embed
+
+
+@bot.command(name="ии_модель", aliases=["ии_модели", "ai_model"])
+@admin_only()
+async def ai_set_model(ctx, purpose: str = None, *, model: str = None):
+    """!ии_модель <цель> <модель> — задать модель под цель (чат/кодинг/картинка)."""
+    gdata = storage.guild(ctx.guild.id)
+    if not purpose:
+        await ctx.reply(embed=_ai_models_embed(gdata))
+        return
+    key = AI_PURPOSES.get(purpose.strip().lower())
+    if not key:
+        await ctx.reply(
+            "❌ Неизвестная цель. Доступно: `чат`, `кодинг`, `картинка`.\n"
+            "Пример: `!ии_модель кодинг kr/qwen3-coder-next`"
+        )
+        return
+    gdata["ai"].setdefault("models", {})
+    if not model or not model.strip() or model.strip().lower() in _FALSE_WORDS | {"сброс", "reset", "default", "по умолчанию"}:
+        gdata["ai"]["models"][key] = None
+        storage.save()
+        await ctx.reply(
+            f"♻️ Модель для «{AI_PURPOSE_LABELS[key]}» сброшена на значение по умолчанию: "
+            f"`{get_ai_model(gdata, key) or '— не задана —'}`."
+        )
+        return
+    gdata["ai"]["models"][key] = model.strip()[:100]
+    storage.save()
+    await ctx.reply(
+        f"✅ Модель для «{AI_PURPOSE_LABELS[key]}» теперь: `{gdata['ai']['models'][key]}`."
+    )
+
+
+def _ai_error_text(status, model: str) -> str:
+    """Понятное сообщение об ошибке запроса к ИИ (для команд !код/!картинка)."""
+    permanent = {
+        400: f"провайдер отклонил запрос (возможно, модель `{model}` не поддерживает эту операцию)",
+        401: "ключ ИИ неверный или просрочен",
+        402: "на балансе ИИ-провайдера закончились средства",
+        403: "провайдер отклонил запрос (проверьте ключ, модель и адрес API)",
+        404: f"модель `{model}` или адрес API не найдены (проверьте `AI_BASE_URL`)",
+    }
+    if status in permanent:
+        return (
+            f"🤖 ИИ сейчас недоступен: {permanent[status]}. "
+            "Проверьте `AI_API_KEY`, `AI_BASE_URL` и модель."
+        )
+    return "🤖 Что-то пошло не так при запросе к ИИ. Попробуйте ещё раз чуть позже."
+
+
+@bot.command(name="код", aliases=["code", "кодинг"])
+async def ai_code_cmd(ctx, *, prompt: str = None):
+    """!код <вопрос> — помощь с программированием отдельной моделью для кода."""
+    if not AI_API_KEY:
+        await ctx.reply(
+            "🤖 ИИ не подключён. Админ, задайте `AI_API_KEY` (и при необходимости "
+            "`AI_BASE_URL`, `AI_MODEL`)."
+        )
+        return
+    if not prompt or not prompt.strip():
+        await ctx.reply("💻 Опишите задачу: `!код напиши функцию быстрой сортировки на Python`")
+        return
+    gdata = storage.guild(ctx.guild.id)
+    model = get_ai_model(gdata, "coding")
+    system = (
+        "Ты — опытный senior-программист и помощник по коду. Отвечай по делу и практично, "
+        "на русском языке. Приводи рабочие примеры кода в блоках ``` с указанием языка, "
+        "кратко поясняй решение и подводные камни. Без лишней воды."
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt.strip()},
+    ]
+    try:
+        async with ctx.typing():
+            answer = await ask_ai(messages, model=model, temperature=0.3, max_tokens=1500)
+    except Exception as exc:
+        status = getattr(exc, "status", None)
+        print(f"[ИИ/код] Ошибка (status={status}): {exc}")
+        await ctx.reply(_ai_error_text(status, model))
+        return
+    if not answer:
+        await ctx.reply("🤖 Пустой ответ модели, попробуйте переформулировать.")
+        return
+    chunks = _split_message(answer)
+    await ctx.reply(chunks[0], allowed_mentions=AI_ALLOWED_MENTIONS)
+    for extra in chunks[1:]:
+        await ctx.send(extra, allowed_mentions=AI_ALLOWED_MENTIONS)
+
+
+@bot.command(name="картинка", aliases=["нарисуй", "рисуй", "image", "имейдж"])
+async def ai_image_cmd(ctx, *, prompt: str = None):
+    """!картинка <описание> — сгенерировать изображение выбранной моделью."""
+    if not AI_API_KEY:
+        await ctx.reply("🤖 ИИ не подключён. Админ, задайте `AI_API_KEY` и `AI_BASE_URL`.")
+        return
+    if not prompt or not prompt.strip():
+        await ctx.reply("🎨 Опишите картинку: `!картинка кот-программист в неоновом городе`")
+        return
+    gdata = storage.guild(ctx.guild.id)
+    model = get_ai_model(gdata, "image")
+    if not model:
+        await ctx.reply(
+            "🎨 Не задана модель для картинок. Админ, укажите её командой "
+            "`!ии_модель картинка <модель>` или переменной окружения `AI_IMAGE_MODEL`."
+        )
+        return
+    try:
+        async with ctx.typing():
+            img_url, raw = await ask_ai_image(prompt.strip(), model)
+    except Exception as exc:
+        status = getattr(exc, "status", None)
+        print(f"[ИИ/картинка] Ошибка (status={status}): {exc}")
+        await ctx.reply(_ai_error_text(status, model))
+        return
+    embed = discord.Embed(
+        title="🎨 Готово",
+        description=_clip(prompt.strip(), 400),
+        color=Colors.LIGHT,
+    )
+    embed.set_footer(text=f"{BRAND_NAME} • модель: {model}")
+    if raw is not None:
+        file = discord.File(io.BytesIO(raw), filename="image.png")
+        embed.set_image(url="attachment://image.png")
+        await ctx.reply(embed=embed, file=file)
+    else:
+        embed.set_image(url=img_url)
+        await ctx.reply(embed=embed)
+
+
 # ---------------------------------------------------------------------------
 # Погода (Open-Meteo — бесплатно, без API-ключа)
 # ---------------------------------------------------------------------------
@@ -2156,6 +2459,41 @@ async def choose_cmd(ctx, *, options: str = None):
     await ctx.reply(f"🤔 Я выбираю: **{random.choice(variants)}**")
 
 
+@bot.command(name="скажи", aliases=["say", "эхо", "оповещение"])
+@staff_only()
+async def say_cmd(ctx, channel: Optional[discord.TextChannel] = None, *, text: str = None):
+    """!скажи [#канал] <текст> — отправить сообщение от лица бота.
+
+    Массовые пинги (@everyone/@here) и пинги ролей отключены для защиты от злоупотреблений.
+    """
+    if not text or not text.strip():
+        await ctx.reply(
+            "🗣️ Использование: `!скажи [#канал] <текст>`\n"
+            "Пример: `!скажи #новости Привет всем!`"
+        )
+        return
+    target = channel or ctx.channel
+    perms = target.permissions_for(ctx.guild.me)
+    if not perms.send_messages:
+        await ctx.reply(f"❌ У меня нет прав писать в {target.mention}.")
+        return
+    # удаляем команду, чтобы сообщение выглядело как от бота
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+    try:
+        await target.send(
+            text.strip(),
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+        )
+    except discord.HTTPException:
+        await ctx.author.send(f"❌ Не удалось отправить сообщение в {target.mention}.")
+        return
+    if target.id != ctx.channel.id:
+        await ctx.send(f"✅ Отправлено в {target.mention}.", delete_after=5)
+
+
 @bot.command(name="помощь")
 async def help_cmd(ctx):
     embed = discord.Embed(title="📖 Команды бота", color=Colors.PRIMARY)
@@ -2205,9 +2543,12 @@ async def help_cmd(ctx):
         name="🧠 ИИ-собеседник (role play)",
         value=(
             f"Упомяните меня ({mention}) в чате — отвечу как ролевой персонаж, "
-            "который шарит за мемы 😎\n"
+            "который шарит за мемы 😎 и может тегать участников\n"
             "`!ии [вкл|выкл]` — вкл/выкл ИИ-собеседника (администрация)\n"
             "`!ии_имя <имя>` — сменить образ персонажа (администрация)\n"
+            "`!ии_модель <цель> <модель>` — модель под цель: чат/кодинг/картинка (администрация)\n"
+            "`!код <вопрос>` — помощь с программированием\n"
+            "`!картинка <описание>` — сгенерировать изображение\n"
             "`!забудь` — очистить память разговора в канале"
         ),
         inline=False,
@@ -2215,6 +2556,7 @@ async def help_cmd(ctx):
     embed.add_field(
         name="🎉 Развлечения и утилиты",
         value=(
+            "`!скажи [#канал] <текст>` — написать от лица бота (поддержка/администрация)\n"
             "`!погода <город>` — прогноз погоды\n"
             "`!мем [сабреддит]` — случайный мем\n"
             "`!аватар [@]` • `!юзер [@]` • `!сервер` — информация\n"

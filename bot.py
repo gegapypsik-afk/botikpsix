@@ -198,6 +198,20 @@ DEFAULT_AI = {
     },
 }
 
+# Настройки приватных (временных) голосовых комнат по умолчанию (на каждый сервер).
+# Идея «join-to-create»: пользователь заходит в канал-создатель, бот делает ему
+# личную голосовую комнату, а панель в текстовом канале-интерфейсе позволяет
+# владельцу управлять ей (лимит, замок, приватность, кик, право говорить и т.п.).
+DEFAULT_PRIVATE_ROOMS = {
+    "enabled": True,
+    "creator_channel_id": None,    # голосовой канал «Создать комнату» (join-to-create)
+    "category_id": None,           # категория Discord, куда создаются комнаты
+    "interface_channel_id": None,  # текстовый канал с панелью управления
+    "default_limit": 0,            # лимит участников по умолчанию (0 = без лимита)
+    "name_template": "Комната {user}",  # шаблон имени комнаты ({user} = ник владельца)
+    "active_rooms": {},            # {channel_id: {"owner_id", "locked", "hidden", "created_at"}}
+}
+
 
 def _default_guild():
     return {
@@ -222,6 +236,7 @@ def _default_guild():
         "open_tickets": {},           # {channel_id: {...}}
         "automod": copy.deepcopy(DEFAULT_AUTOMOD),
         "ai": copy.deepcopy(DEFAULT_AI),
+        "private_rooms": copy.deepcopy(DEFAULT_PRIVATE_ROOMS),  # приватные голосовые комнаты
         "warns": {},                  # предупреждения: {user_id: [{mod_id, reason, ts}, ...]}
     }
 
@@ -269,6 +284,12 @@ class Storage:
         for k, v in base["ai"].items():
             if k not in g["ai"]:
                 g["ai"][k] = v
+        # приватные комнаты — добавляем секцию и недостающие ключи при обновлении
+        if not isinstance(g.get("private_rooms"), dict):
+            g["private_rooms"] = copy.deepcopy(base["private_rooms"])
+        else:
+            for k, v in base["private_rooms"].items():
+                g["private_rooms"].setdefault(k, copy.deepcopy(v) if isinstance(v, (dict, list)) else v)
         # вложенный словарь моделей ИИ — добавляем недостающие цели
         if not isinstance(g["ai"].get("models"), dict):
             g["ai"]["models"] = copy.deepcopy(base["ai"]["models"])
@@ -1016,11 +1037,501 @@ class AutomodPanelView(discord.ui.View):
 
 
 # ---------------------------------------------------------------------------
+# Приватные (временные) голосовые комнаты — «join-to-create»
+# ---------------------------------------------------------------------------
+# Список популярных встроенных активностей Discord (Watch Together, игры и т.п.).
+# {название: application_id}. ID могут меняться на стороне Discord — если запуск
+# не удался, бот покажет понятную ошибку.
+DISCORD_ACTIVITIES = {
+    "🎬 Watch Together (YouTube)": 880218394199220334,
+    "♟️ Chess in the Park": 832012774040141894,
+    "🔴 Checkers in the Park": 832013003968348200,
+    "🃏 Poker Night": 755827207812677713,
+    "🎴 Blazing 8s": 832025144389533716,
+    "✏️ Sketch Heads": 902271654783242291,
+    "🔤 Word Snacks": 879863976006127627,
+    "⛳ Putt Party": 945737671223947305,
+    "🌍 Land-io": 903769130790969345,
+    "😹 Know What I Meme": 950505761862189096,
+}
+
+
+def pr_room_name(template: str, member: discord.Member) -> str:
+    """Имя комнаты по шаблону ({user} → отображаемое имя владельца)."""
+    display = member.display_name
+    try:
+        name = (template or "Комната {user}").format(user=display)
+    except (KeyError, IndexError, ValueError):
+        name = f"Комната {display}"
+    return _clip(name, 100) or f"Комната {display}"
+
+
+def find_owned_room(guild: discord.Guild, gdata: dict, user_id: int):
+    """Возвращает (канал, инфо) активной комнаты владельца или (None, None).
+
+    Попутно вычищает «протухшие» записи о комнатах, которых уже нет на сервере.
+    """
+    pr = gdata["private_rooms"]
+    rooms = pr.get("active_rooms", {})
+    stale = []
+    found = (None, None)
+    for cid, info in list(rooms.items()):
+        channel = guild.get_channel(int(cid))
+        if channel is None:
+            stale.append(cid)
+            continue
+        if info.get("owner_id") == user_id:
+            found = (channel, info)
+    if stale:
+        for cid in stale:
+            rooms.pop(cid, None)
+        storage.save()
+    return found
+
+
+async def create_private_room(member: discord.Member, gdata: dict) -> Optional[discord.VoiceChannel]:
+    """Создаёт личную голосовую комнату для участника и перемещает его в неё."""
+    guild = member.guild
+    pr = gdata["private_rooms"]
+
+    category = guild.get_channel(pr.get("category_id")) if pr.get("category_id") else None
+    if not isinstance(category, discord.CategoryChannel):
+        creator = guild.get_channel(pr.get("creator_channel_id")) if pr.get("creator_channel_id") else None
+        category = creator.category if isinstance(creator, discord.VoiceChannel) else None
+
+    overwrites = {
+        member: discord.PermissionOverwrite(
+            view_channel=True, connect=True, speak=True,
+            manage_channels=True, move_members=True,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, connect=True, speak=True,
+            manage_channels=True, move_members=True,
+        ),
+    }
+
+    limit = int(pr.get("default_limit") or 0)
+    channel = await guild.create_voice_channel(
+        name=pr_room_name(pr.get("name_template"), member),
+        category=category,
+        user_limit=limit,
+        overwrites=overwrites,
+        reason=f"Приватная комната для {member}",
+    )
+
+    pr.setdefault("active_rooms", {})[str(channel.id)] = {
+        "owner_id": member.id,
+        "locked": False,
+        "hidden": False,
+        "speak_restricted": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    storage.save()
+
+    try:
+        await member.move_to(channel, reason="Перемещение в свою приватную комнату")
+    except discord.HTTPException:
+        pass
+    return channel
+
+
+async def delete_private_room(channel: discord.abc.GuildChannel, gdata: dict):
+    """Удаляет пустую комнату и убирает её из хранилища."""
+    gdata["private_rooms"].get("active_rooms", {}).pop(str(channel.id), None)
+    storage.save()
+    try:
+        await channel.delete(reason="Приватная комната опустела")
+    except discord.HTTPException:
+        pass
+
+
+def private_rooms_panel_embed(guild: discord.Guild) -> discord.Embed:
+    embed = discord.Embed(
+        title="⚙️ Приватные комнаты",
+        description=(
+            "Измените конфигурацию вашей комнаты с помощью панели управления.\n"
+            "👑 назначить нового создателя комнаты\n"
+            "🔐 управление доступом к комнате\n"
+            "👥 задать новый лимит участников\n"
+            "🔒 закрыть/открыть комнату\n"
+            "✏️ изменить название комнаты\n"
+            "👁️ скрыть/открыть комнату\n"
+            "👢 выгнать участника из комнаты\n"
+            "🎤 ограничить/выдать право говорить"
+        ),
+        color=Colors.PRIMARY,
+    )
+    brand(embed, guild)
+    return embed
+
+
+def private_rooms_settings_embed(gdata: dict, guild: discord.Guild) -> discord.Embed:
+    pr = gdata["private_rooms"]
+    embed = discord.Embed(title="🔊 Настройки приватных комнат", color=Colors.PRIMARY)
+
+    def chan(cid, prefix="#"):
+        if not cid:
+            return "не задан"
+        ch = guild.get_channel(cid)
+        return ch.mention if ch else f"({cid} — не найден)"
+
+    cat = guild.get_channel(pr.get("category_id")) if pr.get("category_id") else None
+    embed.add_field(name="Статус", value=("🟢 включены" if pr.get("enabled") else "🔴 выключены"), inline=True)
+    embed.add_field(name="Лимит по умолчанию",
+                    value=("без лимита" if not pr.get("default_limit") else str(pr["default_limit"])), inline=True)
+    embed.add_field(name="Активных комнат", value=str(len(pr.get("active_rooms", {}))), inline=True)
+    embed.add_field(name="Канал-создатель", value=chan(pr.get("creator_channel_id")), inline=False)
+    embed.add_field(name="Категория для комнат", value=(cat.name if cat else "не задана"), inline=True)
+    embed.add_field(name="Канал-интерфейс", value=chan(pr.get("interface_channel_id")), inline=True)
+    embed.add_field(name="Шаблон имени", value=f"`{pr.get('name_template') or 'Комната {user}'}`", inline=False)
+    embed.set_footer(text=f"{BRAND_NAME} • !приватки_настройка — авто-создание всех каналов")
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    return embed
+
+
+async def post_private_rooms_panel(channel: discord.abc.Messageable, guild: discord.Guild):
+    await channel.send(embed=private_rooms_panel_embed(guild), view=PrivateRoomInterfaceView())
+
+
+def _room_owner_channel(interaction: discord.Interaction):
+    """Комната, которой владеет нажавший кнопку (или None)."""
+    gdata = storage.guild(interaction.guild.id)
+    channel, info = find_owned_room(interaction.guild, gdata, interaction.user.id)
+    return gdata, channel, info
+
+
+# ---- Модальные окна управления комнатой -----------------------------------
+class RoomLimitModal(discord.ui.Modal, title="Лимит участников"):
+    def __init__(self, channel: discord.VoiceChannel):
+        super().__init__()
+        self.channel = channel
+        self.limit_input = discord.ui.TextInput(
+            label="Лимит участников (0 = без лимита)",
+            placeholder="например: 5",
+            default=str(channel.user_limit or 0),
+            max_length=2,
+        )
+        self.add_item(self.limit_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.limit_input.value).strip()
+        if not raw.isdigit():
+            await interaction.response.send_message("❌ Введите число от 0 до 99.", ephemeral=True)
+            return
+        limit = max(0, min(99, int(raw)))
+        try:
+            await self.channel.edit(user_limit=limit, reason="Изменение лимита приватной комнаты")
+        except discord.HTTPException:
+            await interaction.response.send_message("❌ Не удалось изменить лимит.", ephemeral=True)
+            return
+        text = "снят" if limit == 0 else f"установлен: **{limit}**"
+        await interaction.response.send_message(f"✅ Лимит участников {text}.", ephemeral=True)
+
+
+class RoomRenameModal(discord.ui.Modal, title="Название комнаты"):
+    def __init__(self, channel: discord.VoiceChannel):
+        super().__init__()
+        self.channel = channel
+        self.name_input = discord.ui.TextInput(
+            label="Новое название комнаты",
+            default=channel.name,
+            max_length=100,
+        )
+        self.add_item(self.name_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_name = str(self.name_input.value).strip() or self.channel.name
+        try:
+            await self.channel.edit(name=new_name[:100], reason="Переименование приватной комнаты")
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "❌ Не удалось переименовать (возможно, слишком часто — лимит Discord).",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(f"✅ Название изменено на **{new_name[:100]}**.", ephemeral=True)
+
+
+# ---- Вспомогательные вью с выбором участника ------------------------------
+class _RoomUserSelect(discord.ui.UserSelect):
+    def __init__(self, action, channel, placeholder):
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1)
+        self._action = action
+        self._channel = channel
+
+    async def callback(self, interaction: discord.Interaction):
+        member = interaction.guild.get_member(self.values[0].id)
+        if member is None:
+            await interaction.response.send_message("❌ Участник не найден на сервере.", ephemeral=True)
+            return
+        await self._action(interaction, self._channel, member)
+
+
+class RoomUserActionView(discord.ui.View):
+    def __init__(self, action, channel, placeholder):
+        super().__init__(timeout=120)
+        self.add_item(_RoomUserSelect(action, channel, placeholder))
+
+
+async def _action_transfer(interaction: discord.Interaction, channel: discord.VoiceChannel, member: discord.Member):
+    gdata = storage.guild(interaction.guild.id)
+    info = gdata["private_rooms"].get("active_rooms", {}).get(str(channel.id))
+    if info is None:
+        await interaction.response.send_message("❌ Комната больше не активна.", ephemeral=True)
+        return
+    if member.bot:
+        await interaction.response.send_message("❌ Нельзя назначить владельцем бота.", ephemeral=True)
+        return
+    if member.id == info.get("owner_id"):
+        await interaction.response.send_message("ℹ️ Этот участник уже владелец комнаты.", ephemeral=True)
+        return
+    old_owner = interaction.guild.get_member(info.get("owner_id"))
+    info["owner_id"] = member.id
+    storage.save()
+    try:
+        await channel.set_permissions(
+            member,
+            overwrite=discord.PermissionOverwrite(
+                view_channel=True, connect=True, speak=True,
+                manage_channels=True, move_members=True,
+            ),
+            reason="Передача владения приватной комнатой",
+        )
+        if old_owner is not None:
+            await channel.set_permissions(old_owner, overwrite=None,
+                                          reason="Снятие прав прежнего владельца комнаты")
+    except discord.HTTPException:
+        pass
+    await interaction.response.send_message(f"👑 Новый владелец комнаты — {member.mention}.", ephemeral=True)
+
+
+async def _action_kick(interaction: discord.Interaction, channel: discord.VoiceChannel, member: discord.Member):
+    if member.id == interaction.user.id:
+        await interaction.response.send_message("❌ Нельзя выгнать самого себя.", ephemeral=True)
+        return
+    if member not in channel.members:
+        await interaction.response.send_message("ℹ️ Этого участника нет в вашей комнате.", ephemeral=True)
+        return
+    try:
+        await member.move_to(None, reason="Выгнан из приватной комнаты")
+    except discord.HTTPException:
+        await interaction.response.send_message("❌ Не удалось выгнать участника.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"👢 {member.mention} выгнан из комнаты.", ephemeral=True)
+
+
+async def _action_access(interaction: discord.Interaction, channel: discord.VoiceChannel, member: discord.Member):
+    """Переключатель доступа: выдать или отозвать право входа участнику."""
+    current = channel.overwrites_for(member)
+    if current.connect:
+        await channel.set_permissions(member, overwrite=None, reason="Отзыв доступа к приватной комнате")
+        await interaction.response.send_message(f"🔒 Доступ для {member.mention} отозван.", ephemeral=True)
+    else:
+        await channel.set_permissions(
+            member,
+            overwrite=discord.PermissionOverwrite(view_channel=True, connect=True),
+            reason="Выдача доступа к приватной комнате",
+        )
+        await interaction.response.send_message(f"🔓 {member.mention} получил доступ к комнате.", ephemeral=True)
+
+
+# ---- Активности (Watch Together, игры) ------------------------------------
+class RoomActivitySelect(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label=name, value=str(app_id))
+                   for name, app_id in DISCORD_ACTIVITIES.items()]
+        super().__init__(
+            placeholder="Выбрать активность",
+            min_values=1, max_values=1,
+            options=options,
+            custom_id="pr_activity",
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        gdata, channel, info = _room_owner_channel(interaction)
+        if channel is None:
+            await interaction.response.send_message(
+                "❌ Сначала создайте свою комнату (зайдите в канал-создатель).", ephemeral=True)
+            return
+        app_id = int(self.values[0])
+        try:
+            invite = await channel.create_invite(
+                target_type=discord.InviteTarget.embedded_application,
+                target_application_id=app_id,
+                max_age=0,
+                reason="Запуск активности в приватной комнате",
+            )
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "❌ Не удалось запустить активность. Убедитесь, что у бота есть право "
+                "«Создавать приглашения», и попробуйте другую активность.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"🎮 Активность готова — присоединяйтесь: {invite.url}", ephemeral=True)
+
+
+# ---- Основная панель управления комнатой (persistent) ---------------------
+class PrivateRoomInterfaceView(discord.ui.View):
+    """Единая панель в канале-интерфейсе. Кнопки действуют на комнату того,
+    кто их нажал (владелец должен иметь активную комнату)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(RoomActivitySelect())
+
+    async def _resolve(self, interaction: discord.Interaction):
+        """Возвращает (gdata, channel, info) или None (с отправленной ошибкой)."""
+        gdata, channel, info = _room_owner_channel(interaction)
+        if channel is None:
+            await interaction.response.send_message(
+                "❌ У вас нет активной приватной комнаты. Зайдите в канал-создатель, "
+                "чтобы создать её, затем управляйте ей отсюда.",
+                ephemeral=True,
+            )
+            return None
+        return gdata, channel, info
+
+    @discord.ui.button(emoji="👑", style=discord.ButtonStyle.secondary,
+                       custom_id="pr_transfer", row=1)
+    async def transfer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        resolved = await self._resolve(interaction)
+        if not resolved:
+            return
+        _, channel, _ = resolved
+        await interaction.response.send_message(
+            "Выберите нового владельца комнаты:",
+            view=RoomUserActionView(_action_transfer, channel, "Новый владелец комнаты"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(emoji="🔐", style=discord.ButtonStyle.secondary,
+                       custom_id="pr_access", row=1)
+    async def access(self, interaction: discord.Interaction, button: discord.ui.Button):
+        resolved = await self._resolve(interaction)
+        if not resolved:
+            return
+        _, channel, _ = resolved
+        await interaction.response.send_message(
+            "Выберите участника, чтобы выдать или отозвать доступ:",
+            view=RoomUserActionView(_action_access, channel, "Управление доступом"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(emoji="👥", style=discord.ButtonStyle.secondary,
+                       custom_id="pr_limit", row=1)
+    async def limit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        resolved = await self._resolve(interaction)
+        if not resolved:
+            return
+        _, channel, _ = resolved
+        await interaction.response.send_modal(RoomLimitModal(channel))
+
+    @discord.ui.button(emoji="🔒", style=discord.ButtonStyle.secondary,
+                       custom_id="pr_lock", row=1)
+    async def lock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        resolved = await self._resolve(interaction)
+        if not resolved:
+            return
+        gdata, channel, info = resolved
+        locked = not info.get("locked", False)
+        overwrite = channel.overwrites_for(interaction.guild.default_role)
+        overwrite.connect = False if locked else None
+        try:
+            await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite,
+                                           reason="Закрытие/открытие приватной комнаты")
+        except discord.HTTPException:
+            await interaction.response.send_message("❌ Не удалось изменить доступ.", ephemeral=True)
+            return
+        info["locked"] = locked
+        storage.save()
+        msg = "🔒 Комната закрыта — новые участники не смогут войти." if locked \
+            else "🔓 Комната открыта для входа."
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @discord.ui.button(emoji="✏️", style=discord.ButtonStyle.secondary,
+                       custom_id="pr_rename", row=2)
+    async def rename(self, interaction: discord.Interaction, button: discord.ui.Button):
+        resolved = await self._resolve(interaction)
+        if not resolved:
+            return
+        _, channel, _ = resolved
+        await interaction.response.send_modal(RoomRenameModal(channel))
+
+    @discord.ui.button(emoji="👁️", style=discord.ButtonStyle.secondary,
+                       custom_id="pr_hide", row=2)
+    async def hide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        resolved = await self._resolve(interaction)
+        if not resolved:
+            return
+        gdata, channel, info = resolved
+        hidden = not info.get("hidden", False)
+        overwrite = channel.overwrites_for(interaction.guild.default_role)
+        overwrite.view_channel = False if hidden else None
+        try:
+            await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite,
+                                           reason="Скрытие/открытие приватной комнаты")
+        except discord.HTTPException:
+            await interaction.response.send_message("❌ Не удалось изменить видимость.", ephemeral=True)
+            return
+        info["hidden"] = hidden
+        storage.save()
+        msg = "👁️ Комната скрыта — её не видно в списке каналов." if hidden \
+            else "👁️ Комната снова видна всем."
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @discord.ui.button(emoji="👢", style=discord.ButtonStyle.secondary,
+                       custom_id="pr_kick", row=2)
+    async def kick(self, interaction: discord.Interaction, button: discord.ui.Button):
+        resolved = await self._resolve(interaction)
+        if not resolved:
+            return
+        _, channel, _ = resolved
+        await interaction.response.send_message(
+            "Выберите участника, которого выгнать из комнаты:",
+            view=RoomUserActionView(_action_kick, channel, "Кого выгнать"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(emoji="🎤", style=discord.ButtonStyle.secondary,
+                       custom_id="pr_speak", row=2)
+    async def speak(self, interaction: discord.Interaction, button: discord.ui.Button):
+        resolved = await self._resolve(interaction)
+        if not resolved:
+            return
+        gdata, channel, info = resolved
+        restricted = not info.get("speak_restricted", False)
+        default_ow = channel.overwrites_for(interaction.guild.default_role)
+        default_ow.speak = False if restricted else None
+        owner = interaction.guild.get_member(info.get("owner_id"))
+        try:
+            await channel.set_permissions(interaction.guild.default_role, overwrite=default_ow,
+                                           reason="Ограничение/выдача права говорить")
+            if owner is not None:
+                owner_ow = channel.overwrites_for(owner)
+                owner_ow.speak = True
+                await channel.set_permissions(owner, overwrite=owner_ow,
+                                              reason="Владелец сохраняет право говорить")
+        except discord.HTTPException:
+            await interaction.response.send_message("❌ Не удалось изменить право говорить.", ephemeral=True)
+            return
+        info["speak_restricted"] = restricted
+        storage.save()
+        msg = "🎤 Право говорить ограничено — говорить может только владелец." if restricted \
+            else "🎤 Право говорить выдано всем участникам."
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
 # Настройка бота и команды
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True   # нужно включить в Developer Portal
 intents.members = True           # нужно включить в Developer Portal
+intents.voice_states = True      # нужно для приватных голосовых комнат (входит в default)
 
 
 class TicketBot(commands.Bot):
@@ -1029,6 +1540,7 @@ class TicketBot(commands.Bot):
         self.add_view(TicketPanelView())
         self.add_view(TicketControlView())
         self.add_view(AdminPanelView())
+        self.add_view(PrivateRoomInterfaceView())
 
     async def close(self):
         # аккуратно закрываем общий HTTP-клиент (ИИ/погода/мемы)
@@ -1108,6 +1620,59 @@ async def can_moderate(ctx, member: discord.Member) -> bool:
 async def on_ready():
     print(f"Бот запущен как {bot.user} (ID: {bot.user.id})")
     print(f"Серверов: {len(bot.guilds)}")
+    # Очистка «протухших» приватных комнат: пока бот был офлайн, участники могли
+    # выйти — такие пустые/удалённые комнаты убираем, чтобы не копить мусор.
+    for guild in bot.guilds:
+        gdata = storage.guild(guild.id)
+        rooms = gdata["private_rooms"].get("active_rooms", {})
+        changed = False
+        for cid in list(rooms.keys()):
+            channel = guild.get_channel(int(cid))
+            if channel is None:
+                rooms.pop(cid, None)
+                changed = True
+            elif not channel.members:
+                try:
+                    await channel.delete(reason="Очистка пустой приватной комнаты при запуске")
+                except discord.HTTPException:
+                    pass
+                rooms.pop(cid, None)
+                changed = True
+        if changed:
+            storage.save()
+
+
+@bot.event
+async def on_voice_state_update(member: discord.Member,
+                                before: discord.VoiceState,
+                                after: discord.VoiceState):
+    """Логика «join-to-create»: вход в канал-создатель делает личную комнату,
+    а выход последнего участника удаляет опустевшую комнату."""
+    if member.guild is None:
+        return
+    gdata = storage.guild(member.guild.id)
+    pr = gdata["private_rooms"]
+    if not pr.get("enabled"):
+        return
+
+    # 1) Зашли в канал-создатель → создаём (или возвращаем в существующую) комнату
+    creator_id = pr.get("creator_channel_id")
+    if after.channel is not None and creator_id and after.channel.id == creator_id:
+        existing, _ = find_owned_room(member.guild, gdata, member.id)
+        try:
+            if existing is not None:
+                await member.move_to(existing, reason="Возврат в свою приватную комнату")
+            else:
+                await create_private_room(member, gdata)
+        except discord.Forbidden:
+            print("[Комнаты] Нет прав на создание/перемещение в голосовой канал.")
+        except Exception as exc:  # noqa: BLE001 — не роняем обработчик голоса
+            print(f"[Комнаты] Ошибка создания комнаты: {exc}")
+
+    # 2) Вышли из отслеживаемой комнаты и она опустела → удаляем
+    if before.channel is not None and str(before.channel.id) in pr.get("active_rooms", {}):
+        if not before.channel.members:
+            await delete_private_room(before.channel, gdata)
 
 
 @bot.event
@@ -1769,6 +2334,139 @@ async def show_stats(ctx):
 async def manage_categories(ctx):
     gdata = storage.guild(ctx.guild.id)
     await ctx.reply("Выберите категорию для изменения:", view=CategoryManageView(gdata))
+
+
+# ---- Команды приватных голосовых комнат -----------------------------------
+@bot.command(name="приватки", aliases=["комнаты", "приватные_комнаты"])
+@admin_only()
+async def private_rooms_cmd(ctx, mode: str = None):
+    """Показать настройки приватных комнат или включить/выключить их."""
+    gdata = storage.guild(ctx.guild.id)
+    pr = gdata["private_rooms"]
+    if mode is not None:
+        m = mode.strip().lower()
+        if m in ("вкл", "on", "включить", "1", "да"):
+            pr["enabled"] = True
+        elif m in ("выкл", "off", "выключить", "0", "нет"):
+            pr["enabled"] = False
+        else:
+            await ctx.reply("Использование: `!приватки [вкл|выкл]`")
+            return
+        storage.save()
+    await ctx.reply(embed=private_rooms_settings_embed(gdata, ctx.guild))
+
+
+@bot.command(name="приватки_настройка", aliases=["приватки_setup", "комнаты_настройка"])
+@admin_only()
+async def private_rooms_autosetup(ctx):
+    """Авто-создание категории, канала-создателя, интерфейса и публикация панели."""
+    guild = ctx.guild
+    pr = storage.guild(guild.id)["private_rooms"]
+    try:
+        category = await guild.create_category(
+            "🔊 Приватные комнаты", reason="Автонастройка приватных комнат")
+        creator = await guild.create_voice_channel(
+            "➕ Создать комнату", category=category, reason="Канал-создатель приватных комнат")
+        interface = await guild.create_text_channel(
+            "настройка-комнат", category=category, reason="Интерфейс приватных комнат")
+    except discord.Forbidden:
+        await ctx.reply("❌ У бота нет прав «Управление каналами». Выдайте право и повторите.")
+        return
+    except discord.HTTPException as exc:
+        await ctx.reply(f"❌ Не удалось создать каналы: `{exc}`")
+        return
+
+    pr["category_id"] = category.id
+    pr["creator_channel_id"] = creator.id
+    pr["interface_channel_id"] = interface.id
+    pr["enabled"] = True
+    storage.save()
+
+    try:
+        await post_private_rooms_panel(interface, guild)
+    except discord.HTTPException:
+        pass
+
+    embed = discord.Embed(
+        title="✅ Приватные комнаты настроены",
+        description=(
+            f"Канал-создатель: {creator.mention}\n"
+            f"Категория: **{category.name}**\n"
+            f"Панель управления: {interface.mention}\n\n"
+            "Теперь зайдите в канал-создатель — бот сделает вам личную комнату, "
+            "а управлять ей можно кнопками на панели."
+        ),
+        color=Colors.LIGHT,
+    )
+    brand(embed, guild)
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="приватки_создатель", aliases=["комнаты_создатель"])
+@admin_only()
+async def private_rooms_set_creator(ctx, channel: discord.VoiceChannel):
+    """Назначить голосовой канал-создатель (join-to-create)."""
+    pr = storage.guild(ctx.guild.id)["private_rooms"]
+    pr["creator_channel_id"] = channel.id
+    if not pr.get("category_id") and channel.category:
+        pr["category_id"] = channel.category.id
+    storage.save()
+    await ctx.reply(f"✅ Канал-создатель приватных комнат: {channel.mention}")
+
+
+@bot.command(name="приватки_категория", aliases=["комнаты_категория"])
+@admin_only()
+async def private_rooms_set_category(ctx, category: discord.CategoryChannel):
+    """Категория Discord, в которой будут появляться приватные комнаты."""
+    pr = storage.guild(ctx.guild.id)["private_rooms"]
+    pr["category_id"] = category.id
+    storage.save()
+    await ctx.reply(f"✅ Категория для приватных комнат: **{category.name}**")
+
+
+@bot.command(name="приватки_интерфейс", aliases=["комнаты_интерфейс", "приватки_канал"])
+@admin_only()
+async def private_rooms_set_interface(ctx, channel: discord.TextChannel):
+    """Текстовый канал, где размещается панель управления комнатами."""
+    pr = storage.guild(ctx.guild.id)["private_rooms"]
+    pr["interface_channel_id"] = channel.id
+    storage.save()
+    await ctx.reply(f"✅ Канал-интерфейс приватных комнат: {channel.mention}")
+
+
+@bot.command(name="приватки_лимит", aliases=["комнаты_лимит"])
+@admin_only()
+async def private_rooms_set_limit(ctx, limit: int):
+    """Лимит участников по умолчанию для новых комнат (0 = без лимита)."""
+    pr = storage.guild(ctx.guild.id)["private_rooms"]
+    pr["default_limit"] = max(0, min(99, limit))
+    storage.save()
+    text = "без лимита" if pr["default_limit"] == 0 else str(pr["default_limit"])
+    await ctx.reply(f"✅ Лимит участников по умолчанию: **{text}**")
+
+
+@bot.command(name="приватки_имя", aliases=["комнаты_имя"])
+@admin_only()
+async def private_rooms_set_name(ctx, *, template: str):
+    """Шаблон имени комнаты. Используйте {user} для ника владельца."""
+    pr = storage.guild(ctx.guild.id)["private_rooms"]
+    pr["name_template"] = template[:100]
+    storage.save()
+    await ctx.reply(f"✅ Шаблон имени комнаты: `{pr['name_template']}`")
+
+
+@bot.command(name="приватки_панель", aliases=["комнаты_панель"])
+@admin_only()
+async def private_rooms_send_panel(ctx):
+    """Опубликовать панель управления в канале-интерфейсе (или в текущем канале)."""
+    gdata = storage.guild(ctx.guild.id)
+    pr = gdata["private_rooms"]
+    target_id = pr.get("interface_channel_id")
+    channel = ctx.guild.get_channel(target_id) if target_id else ctx.channel
+    if channel is None:
+        channel = ctx.channel
+    await post_private_rooms_panel(channel, ctx.guild)
+    await ctx.reply(f"✅ Панель управления комнатами отправлена в {channel.mention}.")
 
 
 # ---- Команды модерации -----------------------------------------------------
@@ -2714,6 +3412,20 @@ async def help_cmd(ctx):
             "`!код <вопрос>` — помощь с программированием\n"
             "`!картинка <описание>` — сгенерировать изображение\n"
             "`!забудь` — очистить память разговора в канале"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔊 Приватные голосовые комнаты",
+        value=(
+            "`!приватки_настройка` — авто-создать канал-создатель, категорию и панель\n"
+            "`!приватки` — статус и настройки (вкл/выкл: `!приватки вкл|выкл`)\n"
+            "`!приватки_создатель <#голосовой>` — назначить канал «Создать комнату»\n"
+            "`!приватки_интерфейс <#канал>` — канал с панелью управления\n"
+            "`!приватки_лимит <n>` • `!приватки_имя <шаблон>` — лимит и имя комнат\n"
+            "`!приватки_панель` — опубликовать панель управления\n"
+            "Зашли в канал-создатель → появится личная комната; управляй кнопками "
+            "(👑 владелец, 🔐 доступ, 👥 лимит, 🔒 замок, ✏️ имя, 👁️ скрыть, 👢 кик, 🎤 право говорить)"
         ),
         inline=False,
     )

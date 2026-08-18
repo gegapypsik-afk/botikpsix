@@ -1704,6 +1704,288 @@ bot = TicketBot(
 )
 
 
+# ---------------------------------------------------------------------------
+# Музыкальный плеер (Яндекс/ВК музыка)
+# ---------------------------------------------------------------------------
+class MusicPlayer:
+    def __init__(self, bot):
+        self.bot = bot
+        self.players = {}  # guild_id -> {"voice_client", "queue", "current", "loop", "volume"}
+
+    async def connect_to_voice(self, ctx) -> Optional[discord.VoiceClient]:
+        """Подключиться к голосовому каналу пользователя."""
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            await ctx.reply("❌ Сначала зайди в голосовой канал.")
+            return None
+
+        voice_client = ctx.guild.voice_client
+        if voice_client and voice_client.channel != ctx.author.voice.channel:
+            await voice_client.move_to(ctx.author.voice.channel)
+            return voice_client
+        elif voice_client:
+            return voice_client
+
+        try:
+            return await ctx.author.voice.channel.connect(timeout=30.0)
+        except discord.ClientException:
+            await ctx.reply("❌ Я уже в голосовом канале.")
+            return None
+        except asyncio.TimeoutError:
+            await ctx.reply("❌ Не удалось подключиться к голосовому каналу.")
+            return None
+
+    async def play_yandex_music(self, ctx, query: str):
+        """Воспроизвести музыку из Яндекс Музыки."""
+        voice_client = await self.connect_to_voice(ctx)
+        if not voice_client:
+            return
+
+        await ctx.reply(f"🔍 Ищу трек: `{query}`...")
+
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+        }
+
+        try:
+            import yt_dlp
+
+            if "music.yandex" in query or "yandex.ru/music" in query:
+                url = query
+            else:
+                url = f"ytsearch:\"{query}\""
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if "entries" in info:
+                    info = info["entries"][0]
+
+                title = info.get("title", query)
+                direct_url = info.get("url")
+
+                if not direct_url:
+                    formats = info.get("formats", [])
+                    for f in formats:
+                        if f.get("audio_channels") and f.get("url"):
+                            direct_url = f["url"]
+                            break
+
+                if not direct_url:
+                    await ctx.reply("❌ Не удалось найти аудио для этого трека.")
+                    return
+
+        except Exception as e:
+            print(f"[Music] Ошибка: {e}")
+            await ctx.reply(f"❌ Ошибка при загрузке: `{str(e)}`. Проверь ссылку.")
+            return
+
+        guild_id = ctx.guild.id
+        if guild_id not in self.players:
+            self.players[guild_id] = {
+                "voice_client": voice_client,
+                "queue": [],
+                "current": None,
+                "loop": False,
+                "volume": 0.5,
+            }
+
+        player = self.players[guild_id]
+        player["queue"].append({"title": title, "url": direct_url, "requester": ctx.author.mention})
+
+        if not player["current"]:
+            await self.play_next(ctx.guild)
+
+        embed = discord.Embed(
+            title="🎵 Добавлено в очередь",
+            description=f"**{title}**",
+            color=Colors.PRIMARY,
+        )
+        embed.add_field(name="Запросил", value=ctx.author.mention, inline=True)
+        embed.add_field(name="Позиция в очереди", value=str(len(player["queue"])), inline=True)
+        await ctx.reply(embed=embed)
+
+    async def play_vk_music(self, ctx, query: str):
+        """Воспроизвести музыку из ВК Музыки."""
+        voice_client = await self.connect_to_voice(ctx)
+        if not voice_client:
+            return
+
+        await ctx.reply(f"🎵 Ищу трек из ВК: `{query}`...")
+
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+        }
+
+        try:
+            import yt_dlp
+
+            if "vk.com" in query or "vkmusic" in query:
+                url = query
+            else:
+                url = f"ytsearch:\"{query}\""
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if "entries" in info:
+                    info = info["entries"][0]
+
+                title = info.get("title", query)
+                direct_url = info.get("url")
+
+                if not direct_url:
+                    formats = info.get("formats", [])
+                    for f in formats:
+                        if f.get("audio_channels") and f.get("url"):
+                            direct_url = f["url"]
+                            break
+
+                if not direct_url:
+                    await ctx.reply("❌ Не удалось найти аудио для этого трека.")
+                    return
+
+        except Exception as e:
+            print(f"[Music/VK] Ошибка: {e}")
+            await ctx.reply(f"❌ Ошибка при загрузке: `{str(e)}`.")
+            return
+
+        guild_id = ctx.guild.id
+        if guild_id not in self.players:
+            self.players[guild_id] = {
+                "voice_client": voice_client,
+                "queue": [],
+                "current": None,
+                "loop": False,
+                "volume": 0.5,
+            }
+
+        player = self.players[guild_id]
+        player["queue"].append({"title": title, "url": direct_url, "requester": ctx.author.mention})
+
+        if not player["current"]:
+            await self.play_next(ctx.guild)
+
+        embed = discord.Embed(
+            title="🎵 Добавлено в очередь",
+            description=f"**{title}**",
+            color=Colors.PRIMARY,
+        )
+        embed.add_field(name="Запросил", value=ctx.author.mention, inline=True)
+        embed.add_field(name="Позиция в очереди", value=str(len(player["queue"])), inline=True)
+        await ctx.reply(embed=embed)
+
+    async def play_next(self, guild: discord.Guild):
+        """Воспроизвести следующий трек из очереди."""
+        if guild.id not in self.players:
+            return
+
+        player = self.players[guild.id]
+        voice_client = player.get("voice_client")
+
+        if not voice_client or not voice_client.is_connected():
+            return
+
+        if player["loop"] and not player["queue"]:
+            if player["current"]:
+                player["queue"].append(player["current"])
+
+        if not player["queue"]:
+            player["current"] = None
+            await voice_client.disconnect()
+            return
+
+        track = player["queue"].pop(0)
+        player["current"] = track
+
+        embed = discord.Embed(
+            title="🎵 Сейчас играет",
+            description=f"**{track['title']}**",
+            color=Colors.LIGHT,
+        )
+        embed.add_field(name="Запросил", value=track["requester"], inline=True)
+
+        gdata = storage.guild(guild.id)
+        panel_id = gdata.get("panel_channel_id")
+        log_id = gdata.get("log_channel_id")
+        target_channel = None
+
+        if panel_id:
+            target_channel = guild.get_channel(panel_id)
+        elif log_id:
+            target_channel = guild.get_channel(log_id)
+
+        if target_channel:
+            try:
+                await target_channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+        try:
+            audio_source = discord.PCMVolumeTransformer(
+                discord.FFmpegPCMAudio(track["url"]),
+                volume=player.get("volume", 0.5)
+            )
+            voice_client.play(
+                audio_source,
+                after=lambda e: asyncio.run_coroutine_threadsafe(
+                    self.play_next(guild), self.bot.loop
+                ).result() if e is None else None
+            )
+        except Exception as e:
+            print(f"[Music] Ошибка воспроизведения: {e}")
+            await self.play_next(guild)
+
+    def stop(self, guild: discord.Guild):
+        """Остановить воспроизведение."""
+        if guild.id not in self.players:
+            return
+        voice_client = self.players[guild.id].get("voice_client")
+        if voice_client:
+            voice_client.stop()
+        self.players[guild.id]["current"] = None
+        self.players[guild.id]["queue"] = []
+
+    def skip(self, guild: discord.Guild):
+        """Пропустить текущий трек."""
+        if guild.id not in self.players:
+            return
+        voice_client = self.players[guild.id].get("voice_client")
+        if voice_client and voice_client.is_playing():
+            voice_client.stop()
+
+    def set_volume(self, guild: discord.Guild, volume: float):
+        """Установить громкость (0.0 - 1.0)."""
+        if guild.id not in self.players:
+            return
+        self.players[guild.id]["volume"] = max(0.0, min(1.0, volume))
+
+    def toggle_loop(self, guild: discord.Guild) -> bool:
+        """Переключить цикл. Возвращает текущее состояние."""
+        if guild.id not in self.players:
+            return False
+        self.players[guild.id]["loop"] = not self.players[guild.id]["loop"]
+        return self.players[guild.id]["loop"]
+
+    def get_queue(self, guild: discord.Guild) -> list:
+        """Получить очередь воспроизведения."""
+        if guild.id not in self.players:
+            return []
+        return self.players[guild.id]["queue"]
+
+    def clear_queue(self, guild: discord.Guild):
+        """Очистить очередь."""
+        if guild.id in self.players:
+            self.players[guild.id]["queue"] = []
+
+
+music_player = MusicPlayer(bot)
+
+
 def admin_only():
     async def predicate(ctx: commands.Context):
         if ctx.guild is None:

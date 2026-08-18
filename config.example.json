@@ -8,5 +8,9 @@
   "ai_model": "gpt-4o-mini",
   "ai_model_coding": "",
   "ai_image_model": "",
-  "ai_bot_name": "Ботя"
+  "ai_bot_name": "Ботя",
+  "bot_invite_url": "",
+  "currency_emoji": "💰",
+  "currency_name": "монеты",
+  "currency_plural": "монет"
 }

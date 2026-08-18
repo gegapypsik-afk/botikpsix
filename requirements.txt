@@ -1,2 +1,4 @@
 discord.py>=2.3.2
 aiohttp>=3.9
+yt-dlp>=2024.0.0
+requests>=2.31.0

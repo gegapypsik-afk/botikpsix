@@ -39,7 +39,7 @@ import time
 import base64
 import random
 import asyncio
-from typing import Optional
+from typing import Optional, Tuple
 from datetime import datetime, timezone, timedelta
 
 import aiohttp

@@ -242,6 +242,17 @@ DEFAULT_LEVELS = {
     "custom_emojis": {},            # {name: emoji_string}
 }
 
+# Настройки розыгрышей по умолчанию (на каждый сервер)
+DEFAULT_GIVEAWAYS = {
+    "enabled": True,
+    "giveaways": {},  # {msg_id: {prize, end_time, conditions, description, participants, ended}}
+    "stats": {"created": 0, "ended": 0},
+}
+
+# Роль "лучшие раздатели" (ID: 1531958288109797456)
+BEST_DISTRIBUTOR_ROLE_ID = 1531958288109797456
+
+
 def _default_guild():
     return {
         "admin_roles": [],            # роли администрации
@@ -268,6 +279,7 @@ def _default_guild():
         "private_rooms": copy.deepcopy(DEFAULT_PRIVATE_ROOMS),  # приватные голосовые комнаты
         "warns": {},                  # предупреждения: {user_id: [{mod_id, reason, ts}, ...]}
         "levels": copy.deepcopy(DEFAULT_LEVELS),  # система уровней и валюты
+        "giveaways": copy.deepcopy(DEFAULT_GIVEAWAYS),  # система розыгрышей
     }
 
 
@@ -1692,6 +1704,7 @@ class TicketBot(commands.Bot):
         self.add_view(TicketControlView())
         self.add_view(AdminPanelView())
         self.add_view(PrivateRoomInterfaceView())
+        self.add_view(GiveawayView(msg_id=0, gdata={}))  # GiveawayView с timeout=None внутри
 
     async def close(self):
         # аккуратно закрываем общий HTTP-клиент (ИИ/погода/мемы)
@@ -1700,6 +1713,33 @@ class TicketBot(commands.Bot):
             await _http_session.close()
         _http_session = None
         await super().close()
+
+
+@bot.event
+async def on_ready():
+    print(f"Бот запущен как {bot.user} (ID: {bot.user.id})")
+    print(f"Серверов: {len(bot.guilds)}")
+    # Запускаем фоновый цикл проверки розыгрышей
+    bot.loop.create_task(giveaway_check_loop())
+    # Очистка «протухших» приватных комнат
+    for guild in bot.guilds:
+        gdata = storage.guild(guild.id)
+        rooms = gdata["private_rooms"].get("active_rooms", {})
+        changed = False
+        for cid in list(rooms.keys()):
+            channel = guild.get_channel(int(cid))
+            if channel is None:
+                rooms.pop(cid, None)
+                changed = True
+            elif not channel.members:
+                try:
+                    await channel.delete(reason="Очистка пустой приватной комнаты при запуске")
+                except discord.HTTPException:
+                    pass
+                rooms.pop(cid, None)
+                changed = True
+        if changed:
+            storage.save()
 
 
 bot = TicketBot(
@@ -2844,6 +2884,559 @@ async def levels_config_cmd(ctx, *, options: str = None):
 
     else:
         await ctx.reply("❌ Неизвестная команда. Используйте `!настройки_уровней` без аргументов для справки.")
+
+
+# ---- Команды розыгрышей ----------------------------------------------------
+def can_create_giveaway(member: discord.Member, gdata: dict) -> bool:
+    """Проверка прав на создание розыгрыша: админ или роль "лучшие раздатели"."""
+    if is_admin_member(member, gdata):
+        return True
+    if BEST_DISTRIBUTOR_ROLE_ID in (r.id for r in member.roles):
+        return True
+    return False
+
+
+def _parse_giveaway_date(date_str: str) -> Optional[datetime]:
+    """Разбор даты розыгрыша: форматы '10.08.2025 18:00', '10.08.2025', '1ч', '30м'."""
+    date_str = date_str.strip()
+    now = datetime.now(timezone.utc)
+
+    # Формат: 10.08.2025 18:00 или 10.08.2025
+    try:
+        if ' ' in date_str:
+            dt = datetime.strptime(date_str, "%d.%m.%Y %H:%M")
+        else:
+            dt = datetime.strptime(date_str, "%d.%m.%Y")
+        return dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+
+    # Формат: 1ч, 30м, 5д (от текущего момента)
+    m = re.match(r'^(\d+)([ччммддсs])$', date_str, re.IGNORECASE)
+    if m:
+        value = int(m.group(1))
+        unit = m.group(2).lower()
+        if unit in ('ч', 'h'):
+            return now + timedelta(hours=value)
+        elif unit in ('м', 'm', 'min'):
+            return now + timedelta(minutes=value)
+        elif unit in ('д', 'd'):
+            return now + timedelta(days=value)
+        elif unit in ('с', 's'):
+            return now + timedelta(seconds=value)
+
+    return None
+
+
+def _format_time_left(end_time: datetime) -> str:
+    """Форматирование оставшегося времени до окончания розыгрыша."""
+    now = datetime.now(timezone.utc)
+    diff = end_time - now
+    seconds = int(diff.total_seconds())
+
+    if seconds <= 0:
+        return "⏳ Завершено"
+
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+
+    parts = []
+    if days:
+        parts.append(f"{days} д.")
+    if hours:
+        parts.append(f"{hours} ч.")
+    if minutes:
+        parts.append(f"{minutes} мин.")
+
+    return "⏳ " + " ".join(parts) if parts else "⏳ Мало времени"
+
+
+def _create_giveaway_embed(giveaway: dict, guild: discord.Guild, msg_id: int) -> discord.Embed:
+    """Создание красивого фиолетового эмбеда для розыгрыша."""
+    prize = giveaway.get("prize", "Приз")
+    description = giveaway.get("description", "")
+    end_time = datetime.fromisoformat(giveaway.get("end_time"))
+    conditions = giveaway.get("conditions", "")
+    participants = giveaway.get("participants", [])
+    created_by_id = giveaway.get("created_by")
+
+    creator = guild.get_member(created_by_id) if created_by_id else None
+
+    embed = discord.Embed(
+        title=f"🎉 Розыгрыш: {prize}",
+        description=description or "—",
+        color=Colors.PRIMARY,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    embed.add_field(name="📅 Окончание", value=end_time.strftime("%d.%m.%Y %H:%M"), inline=True)
+    embed.add_field(name="⏳ Осталось", value=_format_time_left(end_time), inline=True)
+    embed.add_field(name="👥 Участники", value=len(participants), inline=True)
+
+    if conditions:
+        embed.add_field(name="⚠️ Условия", value=conditions, inline=False)
+    else:
+        embed.add_field(name="✅ Условия", value="Нет условий участия", inline=False)
+
+    if creator:
+        embed.set_footer(text=f"Организатор: {creator.display_name} • {BRAND_NAME}")
+
+    return embed
+
+
+class GiveawayView(discord.ui.View):
+    """Постоянная панель розыгрыша с кнопками участия и завершения."""
+
+    def __init__(self, msg_id: int, gdata: dict, bot: commands.Bot = None):
+        super().__init__(timeout=None)
+        self.msg_id = msg_id
+        self.gdata = gdata
+        self.bot = bot
+
+    async def _check_conditions(self, member: discord.Member, conditions: str) -> Tuple[bool, str]:
+        """Проверка условий участия. Возвращает (успешно, сообщение)."""
+        if not conditions or conditions.strip() == "Нет условий участия":
+            return True, "Участие без условий"
+
+        conditions = conditions.strip().lower()
+
+        # Условие: "зайти на сервак [invite]"
+        if "сервак" in conditions or "сервер" in conditions:
+            invite_match = re.search(r'(?:discord\.gg/|discord\.com/invite/)(\w+)', conditions)
+            if invite_match:
+                invite_code = invite_match.group(1)
+                try:
+                    # Пытаемся найти сервер по инвайту
+                    for guild in self.bot.guilds if self.bot else []:
+                        try:
+                            invites = await guild.invites()
+                            for invite in invites:
+                                if invite.code == invite_code:
+                                    return True, "Вы на сервере спонсора"
+                        except:
+                            pass
+                    return False, "⚠️ Вы не зашли на сервер спонсора"
+                except:
+                    return False, "⚠️ Не удалось проверить сервер (нужны права)"
+
+            # Если приглашение не найдено, просто сообщаем о необходимости заходить
+            if "спонсор" in conditions:
+                return False, "⚠️ Нужно зайти на сервер спонсора"
+
+        # Условие: роль
+        role_match = re.search(r'роль[@\s]*(\d+)', conditions)
+        if role_match:
+            role_id = int(role_match.group(1))
+            if any(r.id == role_id for r in member.roles):
+                return True, "У вас нужная роль"
+            return False, f"⚠️ У вас нет роли с ID {role_id}"
+
+        # Если условия есть, но не распознаны
+        if conditions:
+            return False, f"⚠️ Условие: {conditions}"
+
+        return True, "Участие без условий"
+
+    @discord.ui.button(label="🎁 Участвовать!", style=discord.ButtonStyle.success)
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Обработка нажатия кнопки "Участвовать"."""
+        msg_id = str(self.msg_id)
+        giveaway = self.gdata["giveaways"].get(msg_id)
+
+        if not giveaway:
+            await interaction.response.send_message("❌ Этот розыгрыш больше не активен.", ephemeral=True)
+            return
+
+        end_time = datetime.fromisoformat(giveaway.get("end_time"))
+        if datetime.now(timezone.utc) >= end_time:
+            await interaction.response.send_message("❌ Розыгрыш уже завершен.", ephemeral=True)
+            return
+
+        if interaction.user.id in giveaway.get("participants", []):
+            await interaction.response.send_message("ℹ️ Вы уже участвуете в этом розыгрыше!", ephemeral=True)
+            return
+
+        conditions = giveaway.get("conditions", "")
+        success, message = await self._check_conditions(interaction.user, conditions)
+
+        if not success:
+            embed = discord.Embed(
+                title="❌ Условия не выполнены",
+                description=message,
+                color=Colors.ACCENT,
+            )
+            brand(embed, interaction.guild)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # Добавляем участника
+        if "participants" not in giveaway:
+            giveaway["participants"] = []
+        giveaway["participants"].append(interaction.user.id)
+        storage.save()
+
+        embed = discord.Embed(
+            title="✅ Вы участвуете!",
+            description=f"Вы добавлены в участники розыгрыша **{giveaway.get('prize')}**",
+            color=Colors.LIGHT,
+        )
+        brand(embed, interaction.guild)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        # Обновляем сообщение розыгрыша
+        ch = interaction.channel
+        if ch:
+            try:
+                msg = await ch.fetch_message(self.msg_id)
+                embed = _create_giveaway_embed(giveaway, interaction.guild, self.msg_id)
+                await msg.edit(embed=embed)
+            except:
+                pass
+
+    @discord.ui.button(label="🏁 Завершить", style=discord.ButtonStyle.danger, row=1)
+    async def end(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Обработка нажатия кнопки "Завершить" - только для организатора."""
+        msg_id = str(self.msg_id)
+        giveaway = self.gdata["giveaways"].get(msg_id)
+
+        if not giveaway:
+            await interaction.response.send_message("❌ Этот розыгрыш больше не активен.", ephemeral=True)
+            return
+
+        if interaction.user.id != giveaway.get("created_by"):
+            await interaction.response.send_message("⛔ Завершить может только организатор розыгрыша.", ephemeral=True)
+            return
+
+        # Завершаем розыгрыш
+        giveaway["ended"] = True
+        storage.save()
+
+        # Выбираем победителя
+        participants = giveaway.get("participants", [])
+        winner_id = random.choice(participants) if participants else None
+
+        if winner_id:
+            winner = interaction.guild.get_member(winner_id)
+            winner_text = winner.mention if winner else f"<@{winner_id}>"
+        else:
+            winner_text = "—"
+
+        # Об��овляем сообщение
+        embed = discord.Embed(
+            title=f"🎉 Розыгрыш завершен!",
+            description=f"Приз: **{giveaway.get('prize')}**",
+            color=Colors.LIGHT,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="Победитель", value=winner_text, inline=False)
+        if participants:
+            embed.add_field(name="Всего участников", value=len(participants), inline=True)
+        brand(embed, interaction.guild)
+
+        try:
+            ch = interaction.channel
+            if ch:
+                msg = await ch.fetch_message(self.msg_id)
+                await msg.edit(embed=embed, view=None)
+        except:
+            pass
+
+        # Отправляем сообщение победителю если есть
+        if winner_id and winner:
+            embed_win = discord.Embed(
+                title="🎉 Поздравляем!",
+                description=f"{winner.mention}\nВы выиграли розыгрыш: **{giveaway.get('prize')}**",
+                color=Colors.LIGHT,
+                timestamp=datetime.now(timezone.utc),
+            )
+            brand(embed_win, interaction.guild)
+            try:
+                await winner.send(embed=embed_win)
+            except:
+                pass
+
+        # Обновляем статистику
+        self.gdata["giveaways"]["stats"]["ended"] = self.gdata["giveaways"].get("stats", {}).get("ended", 0) + 1
+        storage.save()
+
+        await interaction.response.send_message(f"✅ Розыгрыш завершен! Победитель: {winner_text}", ephemeral=True)
+
+
+async def _finish_giveaway(guild: discord.Guild, gdata: dict, msg_id: int, giveaway: dict):
+    """Автоматическое завершение розыгрыша по истечении времени."""
+    participants = giveaway.get("participants", [])
+    winner_id = random.choice(participants) if participants else None
+
+    # Обновляем данные
+    giveaway["ended"] = True
+    storage.save()
+
+    # Обновляем сообщение
+    try:
+        ch = guild.get_channel(giveaway.get("channel_id"))
+        if ch:
+            msg = await ch.fetch_message(int(msg_id))
+            if winner_id:
+                winner = guild.get_member(winner_id)
+                winner_text = winner.mention if winner else f"<@{winner_id}>"
+            else:
+                winner_text = "—"
+
+            embed = discord.Embed(
+                title=f"🎉 Розыгрыш завершен!",
+                description=f"Приз: **{giveaway.get('prize')}**",
+                color=Colors.LIGHT,
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.add_field(name="Победитель", value=winner_text, inline=False)
+            if participants:
+                embed.add_field(name="Всего участников", value=len(participants), inline=True)
+            brand(embed, guild)
+
+            await msg.edit(embed=embed, view=None)
+
+            # Уведомляем победителя
+            if winner_id and winner:
+                embed_win = discord.Embed(
+                    title="🎉 Поздравляем!",
+                    description=f"{winner.mention}\nВы выиграли розыгрыш: **{giveaway.get('prize')}**",
+                    color=Colors.LIGHT,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                brand(embed_win, guild)
+                try:
+                    await winner.send(embed=embed_win)
+                except:
+                    pass
+    except discord.HTTPException:
+        pass
+
+    # Обновляем статистику
+    gdata["giveaways"]["stats"]["ended"] = gdata["giveaways"].get("stats", {}).get("ended", 0) + 1
+    storage.save()
+
+
+async def giveaway_check_loop():
+    """Фоновый цикл проверки окончания розыгрышей."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            for guild in bot.guilds:
+                gdata = storage.guild(guild.id)
+                if not gdata.get("giveaways", {}).get("enabled", True):
+                    continue
+
+                giveaways = gdata.get("giveaways", {}).get("giveaways", {})
+                now = datetime.now(timezone.utc)
+
+                for msg_id, giveaway in list(giveaways.items()):
+                    if giveaway.get("ended"):
+                        continue
+
+                    end_time = datetime.fromisoformat(giveaway.get("end_time"))
+                    if now >= end_time:
+                        await _finish_giveaway(guild, gdata, msg_id, giveaway)
+        except Exception as exc:
+            print(f"[Giveaway] Ошибка проверки: {exc}")
+
+        await asyncio.sleep(60)  # Проверка каждую минуту
+
+
+@bot.command(name="розыгрыш")
+@admin_only()
+async def giveaway_cmd(ctx, *, args: str = None):
+    """Создание розыгрыша.
+
+    Использование: !розыгрыш <приз> | <дата> | <условия> | <описание>
+    Формат даты: DD.MM.YYYY HH:MM или DD.MM.YYYY или 1ч 30м 5д
+    Пример: !розыгрыш 100 монет | 20.08.2025 18:00 | зайди на сервер | классный приз!
+    """
+    if not args:
+        await ctx.reply(
+            "❌ Использование: `!розыгрыш <приз> | <дата> | <условия> | <описание>`\n"
+            "Пример: `!розыгрыш 100 монет | 20.08.2025 18:00 | зайди на сервер | классный приз!`"
+        )
+        return
+
+    # Разбор аргументов
+    parts = [p.strip() for p in args.split("|")]
+    if len(parts) < 2:
+        await ctx.reply("❌ Неверный формат. Используйте `|` как разделитель.")
+        return
+
+    prize = parts[0].strip()
+    end_time = _parse_giveaway_date(parts[1].strip())
+
+    if not end_time:
+        await ctx.reply(
+            "❌ Неверный формат даты.\n"
+            "Используйте: DD.MM.YYYY HH:MM, DD.MM.YYYY, 1ч, 30м, 5д"
+        )
+        return
+
+    conditions = parts[2].strip() if len(parts) > 2 else ""
+    description = parts[3].strip() if len(parts) > 3 else ""
+
+    # Создание эмбеда
+    embed = discord.Embed(
+        title=f"🎉 Розыгрыш: {prize}",
+        description=description or "—",
+        color=Colors.PRIMARY,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="📅 Окончание", value=end_time.strftime("%d.%m.%Y %H:%M"), inline=True)
+    embed.add_field(name="⏳ Осталось", value=_format_time_left(end_time), inline=True)
+    embed.add_field(name="👥 Участники", value="0", inline=True)
+    embed.add_field(name="⚠️ Условия", value=conditions if conditions else "Нет условий участия", inline=False)
+    embed.set_footer(text=f"Организатор: {ctx.author.display_name} • {BRAND_NAME}")
+    brand(embed, ctx.guild)
+
+    # Отправляем сообщение
+    msg = await ctx.send(embed=embed, view=GiveawayView(msg_id=0, gdata={}, bot=bot))
+
+    # Сохраняем данные (msg_id пока 0, обновим после сохранения)
+    gdata = storage.guild(ctx.guild.id)
+    giveaways = gdata.get("giveaways", {})
+    if "giveaways" not in giveaways:
+        giveaways["giveaways"] = {}
+
+    new_msg_id = str(msg.id)
+    giveaways["giveaways"][new_msg_id] = {
+        "prize": prize,
+        "end_time": end_time.isoformat(),
+        "conditions": conditions,
+        "description": description,
+        "participants": [],
+        "ended": False,
+        "created_by": ctx.author.id,
+        "channel_id": ctx.channel.id,
+    }
+    giveaways["stats"]["created"] = giveaways.get("stats", {}).get("created", 0) + 1
+    storage.save()
+
+    # Обновляем view с правильным msg_id
+    view = GiveawayView(msg_id=int(new_msg_id), gdata=gdata, bot=bot)
+    await msg.edit(view=view)
+
+    await ctx.reply(f"✅ Розыгрыш создан: {msg.jump_url}", delete_after=5)
+
+
+@bot.command(name="розыгрыши")
+@admin_only()
+async def giveaways_list_cmd(ctx):
+    """Список активных и завершенных розыгрышей."""
+    gdata = storage.guild(ctx.guild.id)
+    giveaways = gdata.get("giveaways", {}).get("giveaways", {})
+    stats = gdata.get("giveaways", {}).get("stats", {"created": 0, "ended": 0})
+
+    if not giveaways:
+        await ctx.reply("ℹ️ Нет активных розыгрышей.")
+        return
+
+    active = []
+    ended = []
+    now = datetime.now(timezone.utc)
+
+    for msg_id, g in giveaways.items():
+        end_time = datetime.fromisoformat(g.get("end_time"))
+        if g.get("ended"):
+            ended.append((msg_id, g))
+        else:
+            active.append((msg_id, g))
+
+    embed = discord.Embed(
+        title="🎁 Розыгрыши",
+        color=Colors.PRIMARY,
+    )
+    embed.add_field(name="Всего создано", value=str(stats.get("created", 0)), inline=True)
+    embed.add_field(name="Завершено", value=str(stats.get("ended", 0)), inline=True)
+    embed.add_field(name="Активных", value=str(len(active)), inline=True)
+
+    if active:
+        lines = []
+        for msg_id, g in active[:5]:
+            prize = g.get("prize", "—")
+            end = datetime.fromisoformat(g.get("end_time"))
+            participants = len(g.get("participants", []))
+            lines.append(f"**{prize}** | {end.strftime('%d.%m %H:%M')} | 👥 {participants}")
+        embed.add_field(name="Активные", value="\n".join(lines) or "—", inline=False)
+
+    if ended:
+        lines = []
+        for msg_id, g in ended[:5]:
+            prize = g.get("prize", "—")
+            end = datetime.fromisoformat(g.get("end_time"))
+            lines.append(f"**{prize}** | {end.strftime('%d.%m %H:%M')}")
+        embed.add_field(name="Завершенные", value="\n".join(lines) or "—", inline=False)
+
+    brand(embed, ctx.guild)
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="розыгрыши_настройка")
+@admin_only()
+async def giveaways_config_cmd(ctx, *, options: str = None):
+    """Настройка системы розыгрышей."""
+    gdata = storage.guild(ctx.guild.id)
+    giveaways = gdata.setdefault("giveaways", copy.deepcopy(DEFAULT_GIVEAWAYS))
+
+    stats = gdata.get("giveaways", {}).get("stats", {"created": 0, "ended": 0})
+
+    if not options or not options.strip():
+        enabled = giveaways.get("enabled", True)
+        embed = discord.Embed(
+            title="⚙️ Настройки розыгрышей",
+            description=(
+                "Использование:\n"
+                "`!розыгрыши_настройка вкл|выкл` — включить/выключить систему\n"
+                "`!розыгрыши_настройка статистика` — показать статистику\n"
+                "`!розыгрыши_настройка сброс` — сбросить статистику"
+            ),
+            color=Colors.PRIMARY,
+        )
+        embed.add_field(name="Статус", value="🟢 включена" if enabled else "🔴 выключена", inline=True)
+        embed.add_field(name="Всего создано", value=str(stats.get("created", 0)), inline=True)
+        embed.add_field(name="Завершено", value=str(stats.get("ended", 0)), inline=True)
+        embed.add_field(name="Активных", value=str(len(giveaways.get("giveaways", {}))), inline=True)
+        brand(embed, ctx.guild)
+        await ctx.reply(embed=embed)
+        return
+
+    args = options.lower().strip().split()
+    if not args:
+        return
+
+    action = args[0]
+
+    if action in ("вкл", "включить", "on", "1", "да"):
+        giveaways["enabled"] = True
+        storage.save()
+        await ctx.reply("✅ Система розыгрышей включена.")
+
+    elif action in ("выкл", "выключить", "off", "0", "нет"):
+        giveaways["enabled"] = False
+        storage.save()
+        await ctx.reply("❌ Система розыгрышей выключена.")
+
+    elif action == "статистика":
+        embed = discord.Embed(
+            title="📊 Статистика розыгрышей",
+            color=Colors.PRIMARY,
+        )
+        embed.add_field(name="Всего создано", value=str(stats.get("created", 0)), inline=True)
+        embed.add_field(name="Завершено", value=str(stats.get("ended", 0)), inline=True)
+        embed.add_field(name="Активных", value=str(len(giveaways.get("giveaways", {}))), inline=True)
+        brand(embed, ctx.guild)
+        await ctx.reply(embed=embed)
+
+    elif action == "сброс":
+        giveaways["stats"] = {"created": 0, "ended": 0}
+        storage.save()
+        await ctx.reply("✅ Статистика розыгрышей сброшена.")
+
+    else:
+        await ctx.reply("❌ Неизвестная команда. Используйте `!розыгрыши_настройка` без аргументов для справки.")
 
 
 # ---- Команды модерации -----------------------------------------------------
@@ -3996,6 +4589,17 @@ async def help_cmd(ctx):
             "`!приватки_панель` — опубликовать панель управления\n"
             "Зашли в канал-создатель → появится личная комната; управляй кнопками "
             "(👑 владелец, 🔐 доступ, 👥 лимит, 🔒 замок, ✏️ имя, 👁️ скрыть, 👢 кик, 🎤 право говорить)"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🎁 Розыгрыши",
+        value=(
+            "`!розыгрыш <приз> | <дата> | <условия> | <описание>` — создать розыгрыш (админ/лучшие раздатели)\n"
+            "`!розыгрыши` — список активных и завершенных розыгрышей (администрация)\n"
+            "`!розыгрыши_настройка` — настройки системы (вкл/выкл, статистика)\n"
+            "Красивый violet UI: участники жмут «🎁 Участвовать!», проверяются условия, "
+            "победитель выбирается случайно. Победитель получает ЛС с поздравлением."
         ),
         inline=False,
     )

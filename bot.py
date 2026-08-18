@@ -46,6 +46,12 @@ import aiohttp
 import discord
 from discord.ext import commands
 
+# Проверка PyNaCl для голосовых каналов
+try:
+    import nacl
+except ImportError:
+    print("WARNING: PyNaCl not installed - voice features will not work")
+
 # ---------------------------------------------------------------------------
 # Загрузка конфигурации
 # ---------------------------------------------------------------------------

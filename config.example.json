@@ -1,5 +1,5 @@
 {
-  "token": "ВСТАВЬТЕ_СЮДА_ТОКЕН_ТОЛЬКО_ДЛЯ_ЛОКАЛЬНОГО_ЗАПУСКА",
+  "token": "",
   "prefix": "!",
   "brand_name": "yooma.su",
   "brand_url": "https://yooma.su",
@@ -8,8 +8,8 @@
   "ai_model": "gpt-4o-mini",
   "ai_model_coding": "",
   "ai_image_model": "",
-  "ai_bot_name": "Ботя",
-  "bot_invite_url": "",
+  "ai_bot_name": "Смешарик",
+  "bot_invite_url": "https://discord.com/oauth2/authorize?client_id=1531986083162882058",
   "currency_emoji": "💰",
   "currency_name": "монеты",
   "currency_plural": "монет"

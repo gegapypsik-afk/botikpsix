@@ -82,6 +82,13 @@ if not TOKEN:
 BRAND_NAME = os.environ.get("BRAND_NAME") or CONFIG.get("brand_name", "yooma.su")
 BRAND_URL = os.environ.get("BRAND_URL") or CONFIG.get("brand_url", "")
 
+# ---------------------------------------------------------------------------
+# Настройки валюты для системы уровней
+# ---------------------------------------------------------------------------
+CURRENCY_EMOJI = os.environ.get("CURRENCY_EMOJI") or CONFIG.get("currency_emoji", "💰")
+CURRENCY_NAME = os.environ.get("CURRENCY_NAME") or CONFIG.get("currency_name", "монеты")
+CURRENCY_PLURAL = os.environ.get("CURRENCY_PLURAL") or CONFIG.get("currency_plural", "монет")
+
 
 # ---------------------------------------------------------------------------
 # Настройки ИИ-собеседника (OpenAI-совместимый API)
@@ -213,6 +220,22 @@ DEFAULT_PRIVATE_ROOMS = {
 }
 
 
+# Настройки уровней и валюты по умолчанию (на каждый сервер)
+DEFAULT_LEVELS = {
+    "enabled": True,                # включена ли система уровней
+    "currency_emoji": CURRENCY_EMOJI,  # эмодзи валюты
+    "currency_name": CURRENCY_NAME,    # название валюты
+    "currency_plural": CURRENCY_PLURAL,  # название во множественном числе
+    "xp_per_message": 5,            # XP за сообщение
+    "xp_per_image": 10,             # XP за сообщение с картинкой
+    "xp_per_reaction": 2,           # XP за реакцию
+    "cooldown_seconds": 60,         # антифлуд XP (не начислять чаще)
+    "level_up_messages": True,      # показывать сообщение о повышении уровня
+    "leaderboard_channel_id": None, # канал для лидерборда
+    "user_xp": {},                  # {user_id: {"xp": int, "level": int, "last_xp_at": ts}}
+    "custom_emojis": {},            # {name: emoji_string}
+}
+
 def _default_guild():
     return {
         "admin_roles": [],            # роли администрации
@@ -238,6 +261,7 @@ def _default_guild():
         "ai": copy.deepcopy(DEFAULT_AI),
         "private_rooms": copy.deepcopy(DEFAULT_PRIVATE_ROOMS),  # приватные голосовые комнаты
         "warns": {},                  # предупреждения: {user_id: [{mod_id, reason, ts}, ...]}
+        "levels": copy.deepcopy(DEFAULT_LEVELS),  # система уровней и валюты
     }
 
 
@@ -309,6 +333,300 @@ storage = Storage(DATA_FILE)
 
 
 # ---------------------------------------------------------------------------
+# Музыкальный плеер (Яндекс/ВК музыка)
+# ---------------------------------------------------------------------------
+class MusicPlayer:
+    def __init__(self, bot):
+        self.bot = bot
+        self.players = {}  # guild_id -> {"voice_client", "queue", "current", "loop", "volume"}
+
+    async def connect_to_voice(self, ctx) -> Optional[discord.VoiceClient]:
+        """Подключиться к голосовому каналу пользователя."""
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            await ctx.reply("❌ Сначала зайди в голосовой канал.")
+            return None
+
+        voice_client = ctx.guild.voice_client
+        if voice_client and voice_client.channel != ctx.author.voice.channel:
+            await voice_client.move_to(ctx.author.voice.channel)
+            return voice_client
+        elif voice_client:
+            return voice_client
+
+        try:
+            return await ctx.author.voice.channel.connect(timeout=30.0)
+        except discord.ClientException:
+            await ctx.reply("❌ Я уже в голосовом канале.")
+            return None
+        except asyncio.TimeoutError:
+            await ctx.reply("❌ Не удалось подключиться к голосовому каналу.")
+            return None
+
+    async def play_yandex_music(self, ctx, query: str):
+        """Воспроизвести музыку из Яндекс Музыки."""
+        voice_client = await self.connect_to_voice(ctx)
+        if not voice_client:
+            return
+
+        await ctx.reply(f"🔍 Ищу трек: `{query}`...")
+
+        # Формируем URL для Яндекс Музыки API
+        # Используем yt-dlp для поддержки разных источников
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+        }
+
+        try:
+            import yt_dlp
+
+            # Проверяем, это прямая ссылка или поиск
+            if "music.yandex" in query or "yandex.ru/music" in query:
+                url = query
+            else:
+                # Поиск в Яндекс Музыке через yt-dlp
+                url = f"ytsearch:\"{query}\""
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if "entries" in info:
+                    info = info["entries"][0]
+
+                title = info.get("title", query)
+                direct_url = info.get("url")
+
+                if not direct_url:
+                    # Пробуем другой формат
+                    formats = info.get("formats", [])
+                    for f in formats:
+                        if f.get("audio_channels") and f.get("url"):
+                            direct_url = f["url"]
+                            break
+
+                if not direct_url:
+                    await ctx.reply("❌ Не удалось найти аудио для этого трека.")
+                    return
+
+        except Exception as e:
+            print(f"[Music] Ошибка: {e}")
+            await ctx.reply(f"❌ Ошибка при загрузке: `{str(e)}`. Проверь ссылку.")
+            return
+
+        # Добавляем в очередь
+        guild_id = ctx.guild.id
+        if guild_id not in self.players:
+            self.players[guild_id] = {
+                "voice_client": voice_client,
+                "queue": [],
+                "current": None,
+                "loop": False,
+                "volume": 0.5,
+            }
+
+        player = self.players[guild_id]
+        player["queue"].append({"title": title, "url": direct_url, "requester": ctx.author.mention})
+
+        if not player["current"]:
+            await self.play_next(ctx.guild)
+
+        embed = discord.Embed(
+            title="🎵 Добавлено в очередь",
+            description=f"**{title}**",
+            color=Colors.PRIMARY,
+        )
+        embed.add_field(name="Запросил", value=ctx.author.mention, inline=True)
+        embed.add_field(name="Позиция в очереди", value=str(len(player["queue"])), inline=True)
+        await ctx.reply(embed=embed)
+
+    async def play_vk_music(self, ctx, query: str):
+        """Воспроизвести музыку из ВК Музыки."""
+        voice_client = await self.connect_to_voice(ctx)
+        if not voice_client:
+            return
+
+        await ctx.reply(f"🎵 Ищу трек из ВК: `{query}`...")
+
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+        }
+
+        try:
+            import yt_dlp
+
+            # Проверяем, это прямая ссылка или поиск
+            if "vk.com" in query or "vkmusic" in query:
+                url = query
+            else:
+                url = f"ytsearch:\"{query}\""
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if "entries" in info:
+                    info = info["entries"][0]
+
+                title = info.get("title", query)
+                direct_url = info.get("url")
+
+                if not direct_url:
+                    formats = info.get("formats", [])
+                    for f in formats:
+                        if f.get("audio_channels") and f.get("url"):
+                            direct_url = f["url"]
+                            break
+
+                if not direct_url:
+                    await ctx.reply("❌ Не удалось найти аудио для этого трека.")
+                    return
+
+        except Exception as e:
+            print(f"[Music/VK] Ошибка: {e}")
+            await ctx.reply(f"❌ Ошибка при загрузке: `{str(e)}`.")
+            return
+
+        # Добавляем в очередь
+        guild_id = ctx.guild.id
+        if guild_id not in self.players:
+            self.players[guild_id] = {
+                "voice_client": voice_client,
+                "queue": [],
+                "current": None,
+                "loop": False,
+                "volume": 0.5,
+            }
+
+        player = self.players[guild_id]
+        player["queue"].append({"title": title, "url": direct_url, "requester": ctx.author.mention})
+
+        if not player["current"]:
+            await self.play_next(ctx.guild)
+
+        embed = discord.Embed(
+            title="🎵 Добавлено в очередь",
+            description=f"**{title}**",
+            color=Colors.PRIMARY,
+        )
+        embed.add_field(name="Запросил", value=ctx.author.mention, inline=True)
+        embed.add_field(name="Позиция в очереди", value=str(len(player["queue"])), inline=True)
+        await ctx.reply(embed=embed)
+
+    async def play_next(self, guild: discord.Guild):
+        """Воспроизвести следующий трек из очереди."""
+        if guild.id not in self.players:
+            return
+
+        player = self.players[guild.id]
+        voice_client = player.get("voice_client")
+
+        if not voice_client or not voice_client.is_connected():
+            return
+
+        # Если есть цикл и это конец очереди
+        if player["loop"] and not player["queue"]:
+            if player["current"]:
+                player["queue"].append(player["current"])
+
+        if not player["queue"]:
+            player["current"] = None
+            await voice_client.disconnect()
+            return
+
+        # Берём первый элемент из очереди
+        track = player["queue"].pop(0)
+        player["current"] = track
+
+        embed = discord.Embed(
+            title="🎵 Сейчас играет",
+            description=f"**{track['title']}**",
+            color=Colors.LIGHT,
+        )
+        embed.add_field(name="Запросил", value=track["requester"], inline=True)
+
+        # Получаем канал с панелью тикетов или общий канал
+        gdata = storage.guild(guild.id)
+        panel_id = gdata.get("panel_channel_id")
+        log_id = gdata.get("log_channel_id")
+        target_channel = None
+
+        if panel_id:
+            target_channel = guild.get_channel(panel_id)
+        elif log_id:
+            target_channel = guild.get_channel(log_id)
+
+        if target_channel:
+            try:
+                await target_channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+        try:
+            audio_source = discord.PCMVolumeTransformer(
+                discord.FFmpegPCMAudio(track["url"]),
+                volume=player.get("volume", 0.5)
+            )
+            voice_client.play(
+                audio_source,
+                after=lambda e: asyncio.run_coroutine_threadsafe(
+                    self.play_next(guild), self.bot.loop
+                ).result() if e is None else None
+            )
+        except Exception as e:
+            print(f"[Music] Ошибка воспроизведения: {e}")
+            await self.play_next(guild)
+
+    def stop(self, guild: discord.Guild):
+        """Остановить воспроизведение."""
+        if guild.id not in self.players:
+            return
+        voice_client = self.players[guild.id].get("voice_client")
+        if voice_client:
+            voice_client.stop()
+        self.players[guild.id]["current"] = None
+        self.players[guild.id]["queue"] = []
+
+    def skip(self, guild: discord.Guild):
+        """Пропустить текущий трек."""
+        if guild.id not in self.players:
+            return
+        voice_client = self.players[guild.id].get("voice_client")
+        if voice_client and voice_client.is_playing():
+            voice_client.stop()
+
+    def set_volume(self, guild: discord.Guild, volume: float):
+        """Установить громкость (0.0 - 1.0)."""
+        if guild.id not in self.players:
+            return
+        self.players[guild.id]["volume"] = max(0.0, min(1.0, volume))
+
+    def toggle_loop(self, guild: discord.Guild) -> bool:
+        """Переключить цикл. Возвращает текущее состояние."""
+        if guild.id not in self.players:
+            return False
+        self.players[guild.id]["loop"] = not self.players[guild.id]["loop"]
+        return self.players[guild.id]["loop"]
+
+    def get_queue(self, guild: discord.Guild) -> list:
+        """Получить очередь воспроизведения."""
+        if guild.id not in self.players:
+            return []
+        return self.players[guild.id]["queue"]
+
+    def clear_queue(self, guild: discord.Guild):
+        """Очистить очередь."""
+        if guild.id in self.players:
+            self.players[guild.id]["queue"] = []
+
+
+# Глобальный экземпляр плеера
+music_player = MusicPlayer(None)  # Будет установлено после создания бота
+
+
+# ---------------------------------------------------------------------------
 # Модерация: регулярки и разбор длительности
 # ---------------------------------------------------------------------------
 # Ссылки-приглашения в Discord (discord.gg/..., discord.com/invite/..., и т.п.)
@@ -352,6 +670,78 @@ def format_duration(seconds: int) -> str:
             qty, seconds = divmod(seconds, unit)
             parts.append(f"{qty} {label}")
     return " ".join(parts) if parts else "0 сек"
+
+
+# ---------------------------------------------------------------------------
+# Система уровней и XP
+# ---------------------------------------------------------------------------
+async def grant_xp(message: discord.Message):
+    """Начислить XP за сообщение."""
+    if message.author.bot or message.guild is None:
+        return
+
+    gdata = storage.guild(message.guild.id)
+    levels = gdata.get("levels", {})
+
+    if not levels.get("enabled", True):
+        return
+
+    # Проверяем иммунитет (админы, поддержка)
+    if is_admin_member(message.author, gdata) or is_support_member(message.author, gdata):
+        return
+
+    # Проверяем кулдаун
+    user_xp = levels.setdefault("user_xp", {})
+    user_id = str(message.author.id)
+    user_data = user_xp.setdefault(user_id, {"xp": 0, "level": 1, "last_xp_at": 0, "messages": 0})
+
+    now = time.time()
+    cooldown = levels.get("cooldown_seconds", 60)
+    if now - user_data.get("last_xp_at", 0) < cooldown:
+        return
+
+    # Начисляем XP
+    xp_per_message = levels.get("xp_per_message", 5)
+    if message.attachments:
+        xp_per_message += levels.get("xp_per_image", 10)
+
+    user_data["xp"] = user_data.get("xp", 0) + xp_per_message
+    user_data["last_xp_at"] = now
+    user_data["messages"] = user_data.get("messages", 0) + 1
+
+    # Проверяем повышение уровня
+    current_level = user_data.get("level", 1)
+    xp_needed = current_level * 100
+
+    if user_data["xp"] >= xp_needed:
+        user_data["level"] = current_level + 1
+        user_data["xp"] = user_data["xp"] - xp_needed  # перенос остатка XP
+
+        # Уведомление о повышении уровня
+        if levels.get("level_up_messages", True):
+            emoji = levels.get("currency_emoji", CURRENCY_EMOJI)
+            embed = discord.Embed(
+                title="🎉 Новый уровень!",
+                description=f"{message.author.mention} достиг **уровня {user_data['level']}**!",
+                color=Colors.LIGHT,
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.add_field(name="Всего XP", value=str(user_data["xp"] + xp_needed), inline=True)
+            embed.add_field(name="Валюта", value=f"{emoji} {levels.get('currency_name', CURRENCY_NAME)}", inline=True)
+            embed.set_thumbnail(url=message.author.display_avatar.url)
+            brand(embed, message.guild)
+
+            # Отправляем в канал лидерборда если есть, иначе в общий лог
+            lb_channel_id = levels.get("leaderboard_channel_id")
+            if lb_channel_id:
+                channel = message.guild.get_channel(lb_channel_id)
+                if channel:
+                    try:
+                        await channel.send(embed=embed)
+                    except discord.HTTPException:
+                        pass
+
+    storage.save()
 
 
 # ---------------------------------------------------------------------------
@@ -925,6 +1315,56 @@ class AdminPanelView(discord.ui.View):
         channel = interaction.guild.get_channel(target_id) if target_id else interaction.channel
         await post_ticket_panel(channel, gdata)
         await interaction.response.send_message(f"✅ Панель тикетов отправлена в {channel.mention}.", ephemeral=True)
+
+    @discord.ui.button(label="Логи модерации", style=discord.ButtonStyle.secondary,
+                       emoji="📝", custom_id="admin_modlog", row=1)
+    async def modlog_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        gdata = storage.guild(interaction.guild.id)
+        cid = gdata.get("modlog_channel_id") or gdata.get("log_channel_id")
+        channel = interaction.guild.get_channel(cid) if cid else None
+        embed = discord.Embed(
+            title="📝 Логи модерации",
+            description=(
+                f"**Канал:** {channel.mention if channel else 'не задан'}\n\n"
+                "Команды модерации:\n"
+                "`!бан @участник [причина]` — забанить\n"
+                "`!кик @участник [причина]` — кикнуть\n"
+                "`!мут @участник <время> [причина]` — мут\n"
+                "`!размут @участник [причина]` — размут\n"
+                "`!варн @участник [причина]` — предупреждение\n"
+                "`!список_банов` — список забаненных\n"
+                "`!список_мутов` — список мутов"
+            ),
+            color=Colors.PRIMARY,
+        )
+        brand(embed, interaction.guild)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Система уровней", style=discord.ButtonStyle.secondary,
+                       emoji="📊", custom_id="admin_levels", row=1)
+    async def levels_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        gdata = storage.guild(interaction.guild.id)
+        levels = gdata.get("levels", {})
+        emoji = levels.get("currency_emoji", CURRENCY_EMOJI)
+        name = levels.get("currency_name", CURRENCY_NAME)
+        enabled = levels.get("enabled", True)
+
+        embed = discord.Embed(
+            title=f"💰 Система уровней",
+            description=f"**Статус:** {'🟢 включена' if enabled else '🔴 выключена'}",
+            color=Colors.PRIMARY,
+        )
+        embed.add_field(name="Эмодзи", value=emoji, inline=True)
+        embed.add_field(name="Название", value=name, inline=True)
+        embed.add_field(name="XP за сообщение", value=levels.get("xp_per_message", 5), inline=True)
+        embed.add_field(name="Кулдаун", value=f"{levels.get('cooldown_seconds', 60)} сек", inline=True)
+        embed.add_field(name="Участников с XP", value=len(levels.get("user_xp", {})), inline=True)
+        embed.add_field(name="Канал лидерборда", value=f"<#{levels.get('leaderboard_channel_id', 0)}>" if levels.get("leaderboard_channel_id") else "не задан", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1558,6 +1998,9 @@ bot = TicketBot(
     allowed_mentions=discord.AllowedMentions(everyone=False, roles=True, users=True),
 )
 
+# Инициализируем музыкальный плеер с ссылкой на бота
+music_player.bot = bot
+
 
 def admin_only():
     async def predicate(ctx: commands.Context):
@@ -1837,7 +2280,12 @@ def _ai_system_prompt(persona: str, guild_name: str) -> str:
         "Ты можешь тегать (упоминать) участников: просто напиши @их_ник в тексте, "
         "и упоминание станет настоящим пингом. Обращаясь к человеку, зови его по нику через @. "
         "Не пиши @everyone и @here — массовые пинги запрещены. "
-        "Отвечай на том же языке, на котором к тебе обратились."
+        "Отвечай на том же языке, на котором к тебе обратились. "
+        "Если просят код — пиши его без лишних пояснений, в блоках ``` с указанием языка. "
+        "Если просят картинку — просто скажи «Готово, смотри ниже» и генерируй изображение. "
+        "Если чувствуешь, что тема уходит в банальность — подкинь мем, каламбур или отсылку. "
+        "Умей поддерживать разговор: задавай уточняющие вопросы, реагируй на эмоции собеседника. "
+        "Будь адаптивным — если человек в плохом настроении, смягчи тон. Если хорошему — подкинь шутки."
     )
 
 
@@ -2211,6 +2659,12 @@ async def on_message(message: discord.Message):
         except Exception as exc:  # ИИ не должен ронять обработку команд
             print(f"[ИИ] Непредвиденная ошибка: {exc}")
 
+    # Начисление XP за сообщения (если включено)
+    try:
+        await grant_xp(message)
+    except Exception as exc:
+        print(f"[XP] Ошибка начисления: {exc}")
+
     await bot.process_commands(message)
 
 
@@ -2469,6 +2923,221 @@ async def private_rooms_send_panel(ctx):
     await ctx.reply(f"✅ Панель управления комнатами отправлена в {channel.mention}.")
 
 
+# ---- Команды уровней и валюты ---------------------------------------------
+@bot.command(name="уровни", aliases=["lvl", "xp", "уровень"])
+@commands.guild_only()
+async def level_cmd(ctx, member: discord.Member = None):
+    """!уровни [@участник] — показать уровень и XP участника."""
+    member = member or ctx.author
+    gdata = storage.guild(ctx.guild.id)
+    levels = gdata.get("levels", {})
+    user_xp = levels.get("user_xp", {}).get(str(member.id))
+
+    if not levels.get("enabled", True):
+        await ctx.reply("ℹ️ Система уровней на этом сервере выключена.")
+        return
+
+    if not user_xp:
+        await ctx.reply(f"ℹ️ У {member.mention} пока нет XP. Отправляй сообщения и получай уровни!")
+        return
+
+    xp = user_xp.get("xp", 0)
+    level = user_xp.get("level", 1)
+    emoji = levels.get("currency_emoji", CURRENCY_EMOJI)
+
+    # Формула: XP для следующего уровня = level * 100
+    xp_needed = level * 100
+    xp_progress = xp % xp_needed
+
+    # Построим bar
+    bar_length = 20
+    filled = int(xp_progress / xp_needed * bar_length)
+    bar = "█" * filled + "░" * (bar_length - filled)
+
+    embed = discord.Embed(
+        title=f"📊 Уровень {member.display_name}",
+        description=(
+            f"**Уровень:** {level}\n"
+            f"**XP:** {xp} / {xp_needed}\n\n"
+            f"`{bar}` {int(xp_progress / xp_needed * 100)}%"
+        ),
+        color=Colors.PRIMARY,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Валюта", value=f"{emoji} {CURRENCY_NAME}", inline=True)
+    embed.add_field(name="Всего сообщений", value=user_xp.get("messages", 0), inline=True)
+    brand(embed, ctx.guild)
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="топ", aliases=["лидерборд", "лидеры", "leaderboard"])
+@commands.guild_only()
+async def leaderboard_cmd(ctx):
+    """!топ — показать топ 10 участников по уровням."""
+    gdata = storage.guild(ctx.guild.id)
+    levels = gdata.get("levels", {})
+
+    if not levels.get("enabled", True):
+        await ctx.reply("ℹ️ Система уровней на этом сервере выключена.")
+        return
+
+    user_xp = levels.get("user_xp", {})
+    if not user_xp:
+        await ctx.reply("ℹ️ Пока никто не получил XP. Начни первым!")
+        return
+
+    # Сортируем по XP
+    sorted_users = sorted(
+        user_xp.items(),
+        key=lambda x: x[1].get("xp", 0),
+        reverse=True
+    )[:10]
+
+    lines = []
+    for i, (user_id, data) in enumerate(sorted_users, 1):
+        user = ctx.guild.get_member(int(user_id))
+        name = user.display_name if user else f"ID {user_id}"
+        xp = data.get("xp", 0)
+        level = data.get("level", 1)
+        emoji = levels.get("currency_emoji", CURRENCY_EMOJI)
+        lines.append(f"**{i}.** {name} — 📊 **{level}** | 💰 **{xp}**")
+
+    embed = discord.Embed(
+        title=f"🏆 Топ участников по уровням",
+        description="\n".join(lines),
+        color=Colors.LIGHT,
+        timestamp=datetime.now(timezone.utc),
+    )
+    brand(embed, ctx.guild)
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="валюта", aliases=["currency", "моя_валюта", "бабки"])
+@commands.guild_only()
+async def currency_cmd(ctx):
+    """!валюта — показать настройки валюты на сервере."""
+    gdata = storage.guild(ctx.guild.id)
+    levels = gdata.get("levels", {})
+
+    emoji = levels.get("currency_emoji", CURRENCY_EMOJI)
+    name = levels.get("currency_name", CURRENCY_NAME)
+    plural = levels.get("currency_plural", CURRENCY_PLURAL)
+    enabled = levels.get("enabled", True)
+
+    status = "🟢 включена" if enabled else "🔴 выключена"
+
+    embed = discord.Embed(
+        title=f"💰 Настройки валюты",
+        description=f"**Статус:** {status}",
+        color=Colors.PRIMARY,
+    )
+    embed.add_field(name="Эмодзи", value=emoji, inline=True)
+    embed.add_field(name="Название", value=name, inline=True)
+    embed.add_field(name="Мн. число", value=plural, inline=True)
+    embed.add_field(name="XP за сообщение", value=levels.get("xp_per_message", 5), inline=True)
+    embed.add_field(name="XP за картинку", value=levels.get("xp_per_image", 10), inline=True)
+    embed.add_field(name="Кулдаун (сек)", value=levels.get("cooldown_seconds", 60), inline=True)
+    brand(embed, ctx.guild)
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="настройки_уровней", aliases=["lvl_config", "уровни_настройка"])
+@admin_only()
+async def levels_config_cmd(ctx, *, options: str = None):
+    """!настройки_уровней [вкл|выкл] [xp] [эмоции] — настройка системы уровней."""
+    gdata = storage.guild(ctx.guild.id)
+    levels = gdata.setdefault("levels", copy.deepcopy(DEFAULT_LEVELS))
+
+    if not options or not options.strip():
+        embed = discord.Embed(
+            title="⚙️ Настройки уровней",
+            description=(
+                "Использование:\n"
+                "`!настройки_уровней вкл|выкл` — включить/выключить систему\n"
+                "`!настройки_уровней эмоции <эмодзи>` — сменить эмодзи валюты\n"
+                "`!настройки_уровней название <имя>` — сменить название валюты\n"
+                "`!настройки_уровней xp <число>` — XP за сообщение\n"
+                "`!настройки_уровней кулдаун <сек>` — задержка между XP\n"
+                "`!настройки_уровней канал <#канал>` — канал для лидерборда"
+            ),
+            color=Colors.PRIMARY,
+        )
+        embed.add_field(name="Статус", value="🟢 включена" if levels.get("enabled", True) else "🔴 выключена", inline=True)
+        embed.add_field(name="Эмодзи", value=levels.get("currency_emoji", CURRENCY_EMOJI), inline=True)
+        embed.add_field(name="Название", value=levels.get("currency_name", CURRENCY_NAME), inline=True)
+        embed.add_field(name="XP за сообщение", value=levels.get("xp_per_message", 5), inline=True)
+        await ctx.reply(embed=embed)
+        return
+
+    args = options.lower().strip().split()
+    if not args:
+        return
+
+    action = args[0]
+
+    if action in ("вкл", "включить", "on", "1", "да"):
+        levels["enabled"] = True
+        storage.save()
+        await ctx.reply("✅ Система уровней включена.")
+
+    elif action in ("выкл", "выключить", "off", "0", "нет"):
+        levels["enabled"] = False
+        storage.save()
+        await ctx.reply("❌ Система уровней выключена.")
+
+    elif action == "эмоции" and len(args) > 1:
+        emoji = " ".join(args[1:]).strip()
+        levels["currency_emoji"] = emoji[:10]
+        storage.save()
+        await ctx.reply(f"✅ Эмодзи валюты изменён на: {emoji}")
+
+    elif action == "название" and len(args) > 1:
+        name = " ".join(args[1:]).strip()
+        levels["currency_name"] = name[:50]
+        levels["currency_plural"] = name[:50]  # упрощено
+        storage.save()
+        await ctx.reply(f"✅ Название валюты изменено на: {name}")
+
+    elif action == "xp" and len(args) > 1:
+        try:
+            xp = int(args[1])
+            levels["xp_per_message"] = max(1, min(100, xp))
+            storage.save()
+            await ctx.reply(f"✅ XP за сообщение установлен: {xp}")
+        except ValueError:
+            await ctx.reply("❌ XP должно быть числом.")
+
+    elif action == "кулдаун" and len(args) > 1:
+        try:
+            sec = int(args[1])
+            levels["cooldown_seconds"] = max(10, min(300, sec))
+            storage.save()
+            await ctx.reply(f"✅ Кулдаун между XP установлен: {sec} сек")
+        except ValueError:
+            await ctx.reply("❌ Кулдаун должен быть числом.")
+
+    elif action == "канал" and len(args) > 1:
+        channel = ctx.channel
+        if ctx.message.mentions:
+            await ctx.reply("❌ Укажите канал (#канал), а не пользователя.")
+            return
+        # Ищем упоминание канала через парсинг
+        channel_match = re.search(r'<#(\d+)>', options)
+        if channel_match:
+            channel_id = int(channel_match.group(1))
+            channel = ctx.guild.get_channel(channel_id)
+        if channel and isinstance(channel, discord.TextChannel):
+            levels["leaderboard_channel_id"] = channel.id
+            storage.save()
+            await ctx.reply(f"✅ Канал лидерборда установлен: {channel.mention}")
+        else:
+            await ctx.reply("❌ Канал не найден. Используйте #канал.")
+
+    else:
+        await ctx.reply("❌ Неизвестная команда. Используйте `!настройки_уровней` без аргументов для справки.")
+
+
 # ---- Команды модерации -----------------------------------------------------
 def _mod_embed(title, color, member, moderator, reason, extra=None):
     embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
@@ -2566,6 +3235,70 @@ async def unmute_cmd(ctx, member: discord.Member, *, reason: str = "Причин
     embed = _mod_embed("🔊 Мут снят", Colors.LIGHT, member, ctx.author, reason)
     await ctx.reply(embed=embed)
     await mod_log(ctx.guild, storage.guild(ctx.guild.id), embed)
+
+
+# ---- Список банов и мутов --------------------------------------------------
+@bot.command(name="список_банов", aliases=["баны", "bans"])
+@admin_only()
+async def list_bans_cmd(ctx):
+    """!список_банов — показать список всех забаненных участников."""
+    try:
+        bans = await ctx.guild.bans()
+    except discord.Forbidden:
+        await ctx.reply("❌ У меня нет права «Банить участников».")
+        return
+
+    if not bans:
+        await ctx.reply("✅ На сервере нет забаненных участников.")
+        return
+
+    lines = []
+    for i, ban_entry in enumerate(bans[:10], 1):  # Лимит 10 строк
+        user = ban_entry.user
+        reason = ban_entry.reason or "причина не указана"
+        lines.append(f"**{i}.** {user.mention} (`{user}`)\n   ID: `{user.id}`\n   Причина: {reason}")
+
+    embed = discord.Embed(
+        title=f"🔨 Забаненные участники ({len(bans)})",
+        description="\n\n".join(lines),
+        color=Colors.DANGER,
+        timestamp=datetime.now(timezone.utc),
+    )
+    brand(embed, ctx.guild)
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="список_мутов", aliases=["муты", "timeouts", "муты_сейчас"])
+@staff_only()
+async def list_timeouts_cmd(ctx):
+    """!список_мутов — показать список участников с тайм-аутами."""
+    guild = ctx.guild
+    muted_members = []
+
+    for member in guild.members:
+        if member.is_timed_out():
+            muted_members.append(member)
+
+    if not muted_members:
+        await ctx.reply("✅ На сервере нет участников в муте.")
+        return
+
+    lines = []
+    for i, member in enumerate(muted_members[:10], 1):  # Лимит 10 строк
+        remaining = member.timed_out_until - datetime.now(timezone.utc)
+        remaining_sec = int(remaining.total_seconds())
+        remaining_str = format_duration(remaining_sec) if remaining_sec > 0 else "до снятия"
+        reason = member.active_mod_log() if hasattr(member, 'active_mod_log') and member.active_mod_log() else "причина не указана"
+        lines.append(f"**{i}.** {member.mention} (`{member.display_name}`)\n   Снят: **{remaining_str}**\n   Причина: {reason}")
+
+    embed = discord.Embed(
+        title=f"🔇 Участники в муте ({len(muted_members)})",
+        description="\n\n".join(lines),
+        color=Colors.ACCENT,
+        timestamp=datetime.now(timezone.utc),
+    )
+    brand(embed, ctx.guild)
+    await ctx.reply(embed=embed)
 
 
 # ---- Предупреждения (варны) ------------------------------------------------
@@ -2842,6 +3575,128 @@ async def automod_exempt_role(ctx, role: discord.Role):
         roles.append(role.id)
         storage.save()
         await ctx.reply(f"➕ Роль {role.mention} получила иммунитет к автомоду.")
+
+
+# ---- Команды музыкального плеера ------------------------------------------
+@bot.command(name="в playing", aliases=["join", "подключись", "вступи"])
+async def join_vc_cmd(ctx):
+    """!в playing — подключиться к голосовому каналу."""
+    voice_client = ctx.guild.voice_client
+    if voice_client and voice_client.is_connected():
+        await ctx.reply(f"✅ Я уже в голосовом канале: {voice_client.channel.mention}")
+        return
+
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.reply("❌ Сначала зайди в голосовой канал.")
+        return
+
+    try:
+        voice_client = await ctx.author.voice.channel.connect(timeout=30.0)
+        await ctx.reply(f"🎵 Подключился к каналу: {voice_client.channel.mention}")
+    except discord.ClientException:
+        await ctx.reply("❌ Я уже подключен к голосовому каналу.")
+    except asyncio.TimeoutError:
+        await ctx.reply("❌ Не удалось подключиться к голосовому каналу.")
+
+
+@bot.command(name="выход", aliases=["leave", "выйди", "disconnected"])
+async def leave_vc_cmd(ctx):
+    """!выход — отключиться от голосового канала."""
+    voice_client = ctx.guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        await ctx.reply("❌ Я не подключен к голосовому каналу.")
+        return
+
+    music_player.stop(ctx.guild)
+    await voice_client.disconnect()
+    await ctx.reply("👋 Отключился от голосового канала.")
+
+
+@bot.command(name="играй", aliases=["play", "музыка", "загрузи"])
+async def play_cmd(ctx, *, query: str = None):
+    """!играй <название или ссылка> — воспроизвести музыку."""
+    if not query or not query.strip():
+        await ctx.reply("🎵 Укажи название трека или ссылку:\n`!играй название песни`")
+        return
+
+    # Проверяем источник
+    if "music.yandex" in query or "yandex.ru/music" in query:
+        await music_player.play_yandex_music(ctx, query)
+    elif "vk.com" in query or "vkmusic" in query:
+        await music_player.play_vk_music(ctx, query)
+    else:
+        # Пытаемся сначала Яндекс, потом ВК
+        await music_player.play_yandex_music(ctx, query)
+
+
+@bot.command(name="стоп", aliases=["stop", "отмена"])
+async def stop_cmd(ctx):
+    """!стоп — остановить воспроизведение."""
+    music_player.stop(ctx.guild)
+    await ctx.reply("⏹️ Воспроизведение остановлено.")
+
+
+@bot.command(name="пропустить", aliases=["skip", "следующий"])
+async def skip_cmd(ctx):
+    """!пропустить — пропустить текущий трек."""
+    music_player.skip(ctx.guild)
+    await ctx.reply("⏭️ Пропущено.")
+
+
+@bot.command(name="громкость", aliases=["volume", "глаза"])
+async def volume_cmd(ctx, volume: int = None):
+    """!громкость [1-100] — установить громкость."""
+    if volume is None:
+        player = music_player.players.get(ctx.guild.id)
+        current = int((player.get("volume", 0.5) if player else 0.5) * 100)
+        await ctx.reply(f"🔊 Текущая громкость: **{current}%**")
+        return
+
+    if not 1 <= volume <= 100:
+        await ctx.reply("❌ Громкость должна быть от 1 до 100.")
+        return
+
+    music_player.set_volume(ctx.guild, volume / 100)
+    await ctx.reply(f"🔊 Громкость установлена: **{volume}%**")
+
+
+@bot.command(name="цикл", aliases=["loop", "повтор"])
+async def loop_cmd(ctx):
+    """!цикл — включить/выключить повтор очереди."""
+    looped = music_player.toggle_loop(ctx.guild)
+    await ctx.reply(f"🔄 Повтор очереди: **{'ВКЛ' if looped else 'ВЫКЛ'}**")
+
+
+@bot.command(name="очередь", aliases=["queue", "список"])
+async def queue_cmd(ctx):
+    """!очередь — показать очередь воспроизведения."""
+    queue = music_player.get_queue(ctx.guild)
+
+    if not queue:
+        await ctx.reply("🎵 Очередь пуста. Добавь треки командой `!играй`.")
+        return
+
+    lines = []
+    for i, track in enumerate(queue[:10], 1):
+        lines.append(f"**{i}.** {track['title']}")
+        lines[-1] += f" — {track['requester']}"
+
+    if len(queue) > 10:
+        lines.append(f"... и ещё **{len(queue) - 10}** треков")
+
+    embed = discord.Embed(
+        title=f"🎵 Очередь воспроизведения ({len(queue)})",
+        description="\n".join(lines),
+        color=Colors.PRIMARY,
+    )
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="очистить_очередь", aliases=["clear_queue", "очистить"])
+async def clear_queue_cmd(ctx):
+    """!очистить_очередь — очистить очередь."""
+    music_player.clear_queue(ctx.guild)
+    await ctx.reply("🗑️ Очередь очищена.")
 
 
 # ---------------------------------------------------------------------------

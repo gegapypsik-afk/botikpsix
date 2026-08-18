@@ -3571,6 +3571,13 @@ async def automod_exempt_role(ctx, role: discord.Role):
 @bot.command(name="в playing", aliases=["join", "подключись", "вступи"])
 async def join_vc_cmd(ctx):
     """!в playing — подключиться к голосовому каналу."""
+    # Проверка PyNaCl
+    try:
+        import nacl
+    except ImportError:
+        await ctx.reply("❌ Ошибка: PyNaCl не установлен. Установи `pip install PyNaCl`")
+        return
+
     voice_client = ctx.guild.voice_client
     if voice_client and voice_client.is_connected():
         await ctx.reply(f"✅ Я уже в голосовом канале: {voice_client.channel.mention}")

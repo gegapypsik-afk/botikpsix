@@ -1704,7 +1704,6 @@ class TicketBot(commands.Bot):
         self.add_view(TicketControlView())
         self.add_view(AdminPanelView())
         self.add_view(PrivateRoomInterfaceView())
-        self.add_view(GiveawayView(msg_id=0, gdata={}))  # GiveawayView с timeout=None внутри
 
     async def close(self):
         # аккуратно закрываем общий HTTP-клиент (ИИ/погода/мемы)
@@ -1713,6 +1712,14 @@ class TicketBot(commands.Bot):
             await _http_session.close()
         _http_session = None
         await super().close()
+
+
+bot = TicketBot(
+    command_prefix=PREFIX,
+    intents=intents,
+    help_command=None,
+    allowed_mentions=discord.AllowedMentions(everyone=False, roles=True, users=True),
+)
 
 
 @bot.event
@@ -1740,14 +1747,6 @@ async def on_ready():
                 changed = True
         if changed:
             storage.save()
-
-
-bot = TicketBot(
-    command_prefix=PREFIX,
-    intents=intents,
-    help_command=None,
-    allowed_mentions=discord.AllowedMentions(everyone=False, roles=True, users=True),
-)
 
 
 def admin_only():

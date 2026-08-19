@@ -3041,7 +3041,10 @@ class GiveawayView(discord.ui.View):
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Обработка нажатия кнопки "Участвовать"."""
         msg_id = str(self.msg_id)
-        giveaway = self.gdata["giveaways"].get(msg_id)
+        # Загружаем актуальные данные из storage
+        gdata = storage.guild(interaction.guild.id)
+        giveaways = gdata.get("giveaways", {}).get("giveaways", {})
+        giveaway = giveaways.get(msg_id)
 
         if not giveaway:
             await interaction.response.send_message("❌ Этот розыгрыш больше не активен.", ephemeral=True)
@@ -3097,7 +3100,10 @@ class GiveawayView(discord.ui.View):
     async def end(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Обработка нажатия кнопки "Завершить" - только для организатора."""
         msg_id = str(self.msg_id)
-        giveaway = self.gdata["giveaways"].get(msg_id)
+        # Загружаем актуальные данные из storage
+        gdata = storage.guild(interaction.guild.id)
+        giveaways = gdata.get("giveaways", {}).get("giveaways", {})
+        giveaway = giveaways.get(msg_id)
 
         if not giveaway:
             await interaction.response.send_message("❌ Этот розыгрыш больше не активен.", ephemeral=True)
@@ -3277,6 +3283,25 @@ async def giveaway_cmd(ctx, *, args: str = None):
     conditions = parts[2].strip() if len(parts) > 2 else ""
     description = parts[3].strip() if len(parts) > 3 else ""
 
+    # Сохраняем данные СНАЧАЛА (пока msg_id еще не известен, используем временный)
+    gdata = storage.guild(ctx.guild.id)
+    giveaways = gdata.setdefault("giveaways", copy.deepcopy(DEFAULT_GIVEAWAYS))
+    giveaways.setdefault("giveaways", {})
+    new_msg_id = str(random.randint(1000000000, 9999999999))  # Временный ID
+    giveaways["giveaways"][new_msg_id] = {
+        "prize": prize,
+        "end_time": end_time.isoformat(),
+        "conditions": conditions,
+        "description": description,
+        "participants": [],
+        "ended": False,
+        "created_by": ctx.author.id,
+        "channel_id": ctx.channel.id,
+        "temp_msg_id": new_msg_id,
+    }
+    giveaways["stats"]["created"] = giveaways.get("stats", {}).get("created", 0) + 1
+    storage.save()
+
     # Создание эмбеда
     embed = discord.Embed(
         title=f"🎉 Розыгрыш: {prize}",
@@ -3292,31 +3317,15 @@ async def giveaway_cmd(ctx, *, args: str = None):
     brand(embed, ctx.guild)
 
     # Отправляем сообщение
-    msg = await ctx.send(embed=embed, view=GiveawayView(msg_id=0, gdata={}, bot=bot))
+    msg = await ctx.send(embed=embed)
 
-    # Сохраняем данные (msg_id пока 0, обновим после сохранения)
-    gdata = storage.guild(ctx.guild.id)
-    giveaways = gdata.get("giveaways", {})
-    if "giveaways" not in giveaways:
-        giveaways["giveaways"] = {}
-
-    new_msg_id = str(msg.id)
-    giveaways["giveaways"][new_msg_id] = {
-        "prize": prize,
-        "end_time": end_time.isoformat(),
-        "conditions": conditions,
-        "description": description,
-        "participants": [],
-        "ended": False,
-        "created_by": ctx.author.id,
-        "channel_id": ctx.channel.id,
-    }
-    giveaways["stats"]["created"] = giveaways.get("stats", {}).get("created", 0) + 1
-    storage.save()
-
-    # Обновляем view с правильным msg_id
+    # Создаем view с правильным msg_id и отправляем
     view = GiveawayView(msg_id=int(new_msg_id), gdata=gdata, bot=bot)
-    await msg.edit(view=view)
+    await msg.edit(embed=embed, view=view)
+
+    # Обновляем temp_msg_id на реальный ID сообщения
+    giveaways["giveaways"][new_msg_id]["msg_id"] = str(msg.id)
+    storage.save()
 
     await ctx.reply(f"✅ Розыгрыш создан: {msg.jump_url}", delete_after=5)
 

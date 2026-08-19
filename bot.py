@@ -2906,7 +2906,10 @@ def _parse_giveaway_date(date_str: str) -> Optional[datetime]:
             dt = datetime.strptime(date_str, "%d.%m.%Y %H:%M")
         else:
             dt = datetime.strptime(date_str, "%d.%m.%Y")
-        return dt.replace(tzinfo=timezone.utc)
+        # Если datetime без timezone, добавляем UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except ValueError:
         pass
 
@@ -2925,6 +2928,14 @@ def _parse_giveaway_date(date_str: str) -> Optional[datetime]:
             return now + timedelta(seconds=value)
 
     return None
+
+
+def _parse_giveaway_end_time(iso_str: str) -> datetime:
+    """Извлекает datetime из isoformat, добавляя UTC timezone если его нет."""
+    dt = _parse_giveaway_end_time(iso_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _format_time_left(end_time: datetime) -> str:
@@ -2955,7 +2966,7 @@ def _create_giveaway_embed(giveaway: dict, guild: discord.Guild, msg_id: int) ->
     """Создание красивого фиолетового эмбеда для розыгрыша."""
     prize = giveaway.get("prize", "Приз")
     description = giveaway.get("description", "")
-    end_time = datetime.fromisoformat(giveaway.get("end_time"))
+    end_time = _parse_giveaway_end_time(giveaway.get("end_time"))
     conditions = giveaway.get("conditions", "")
     participants = giveaway.get("participants", [])
     created_by_id = giveaway.get("created_by")
@@ -3050,7 +3061,7 @@ class GiveawayView(discord.ui.View):
             await interaction.response.send_message("❌ Этот розыгрыш больше не активен.", ephemeral=True)
             return
 
-        end_time = datetime.fromisoformat(giveaway.get("end_time"))
+        end_time = _parse_giveaway_end_time(giveaway.get("end_time"))
         if datetime.now(timezone.utc) >= end_time:
             await interaction.response.send_message("❌ Розыгрыш уже завершен.", ephemeral=True)
             return
@@ -3239,7 +3250,7 @@ async def giveaway_check_loop():
                     if giveaway.get("ended"):
                         continue
 
-                    end_time = datetime.fromisoformat(giveaway.get("end_time"))
+                    end_time = _parse_giveaway_end_time(giveaway.get("end_time"))
                     if now >= end_time:
                         await _finish_giveaway(guild, gdata, msg_id, giveaway)
         except Exception as exc:
@@ -3347,7 +3358,7 @@ async def giveaways_list_cmd(ctx):
     now = datetime.now(timezone.utc)
 
     for msg_id, g in giveaways.items():
-        end_time = datetime.fromisoformat(g.get("end_time"))
+        end_time = _parse_giveaway_end_time(g.get("end_time"))
         if g.get("ended"):
             ended.append((msg_id, g))
         else:
@@ -3365,7 +3376,7 @@ async def giveaways_list_cmd(ctx):
         lines = []
         for msg_id, g in active[:5]:
             prize = g.get("prize", "—")
-            end = datetime.fromisoformat(g.get("end_time"))
+            end = _parse_giveaway_end_time(g.get("end_time"))
             participants = len(g.get("participants", []))
             lines.append(f"**{prize}** | {end.strftime('%d.%m %H:%M')} | 👥 {participants}")
         embed.add_field(name="Активные", value="\n".join(lines) or "—", inline=False)
@@ -3374,7 +3385,7 @@ async def giveaways_list_cmd(ctx):
         lines = []
         for msg_id, g in ended[:5]:
             prize = g.get("prize", "—")
-            end = datetime.fromisoformat(g.get("end_time"))
+            end = _parse_giveaway_end_time(g.get("end_time"))
             lines.append(f"**{prize}** | {end.strftime('%d.%m %H:%M')}")
         embed.add_field(name="Завершенные", value="\n".join(lines) or "—", inline=False)
 
